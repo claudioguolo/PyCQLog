@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=PyCQLog
+GenericName=Amateur Radio Logger
+Comment=Desktop logger for amateur radio built with Python and PyQt
+Exec=pycqlog
+Icon=pycqlog
+Terminal=false
+Categories=Network;Utility;
+Keywords=ham radio;amateur radio;QSO;ADIF;logging;
+StartupNotify=true
