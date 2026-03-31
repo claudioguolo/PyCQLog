@@ -77,33 +77,87 @@ def build_stylesheet(theme: ThemePalette) -> str:
         background: {theme.panel_alt_bg};
     }}
     QLabel#headerLabel {{
-        font-size: 26px;
+        font-size: 25px;
         font-weight: 700;
         color: {theme.text};
+    }}
+    QLabel#consoleBadge {{
+        background: {theme.button_bg};
+        color: {theme.button_text};
+        border-radius: 9px;
+        padding: 3px 8px;
+        font-size: 11px;
+        font-weight: 700;
     }}
     QLabel#sectionLabel {{
-        font-size: 20px;
+        font-size: 18px;
         font-weight: 700;
         color: {theme.text};
     }}
+    QLabel#fieldHeroLabel {{
+        font-size: 11px;
+        font-weight: 700;
+        color: {theme.muted_text};
+    }}
     QLabel#filterLabel {{
-        font-size: 15px;
+        font-size: 11px;
         font-weight: 700;
         color: {theme.text};
+    }}
+    QLabel#inlineFilterLabel {{
+        font-size: 10px;
+        font-weight: 700;
+        color: {theme.muted_text};
+    }}
+    QLabel#mutedLabel, QLabel#summaryCardTitle {{
+        color: {theme.muted_text};
+        font-size: 12px;
+        font-weight: 600;
+    }}
+    QLabel#summaryCardValue {{
+        color: {theme.text};
+        font-size: 18px;
+        font-weight: 700;
+    }}
+    QLabel#footerMeta {{
+        color: {theme.muted_text};
+        font-size: 11px;
+        font-weight: 600;
+    }}
+    QLabel#footerStatus {{
+        color: {theme.text};
+        font-size: 12px;
+        font-weight: 600;
     }}
     QWidget#dashboardCard {{
         background: {theme.panel_bg};
         border: 1px solid {theme.border};
         border-radius: 12px;
     }}
+    QFrame#workspaceCard, QFrame#summaryCard, QFrame#statusCard, QFrame#entryBarCard {{
+        background: {theme.panel_bg};
+        border: 1px solid {theme.border};
+        border-radius: 16px;
+    }}
+    QFrame#summaryCard {{
+        background: {theme.panel_alt_bg};
+    }}
+    QFrame#statusCard {{
+        background: {theme.panel_alt_bg};
+        border-left: 4px solid {theme.button_bg};
+    }}
+    QFrame#footerStatusBar {{
+        background: transparent;
+        border-top: 1px solid {theme.border};
+    }}
     QLabel#dashboardCardTitle {{
         color: {theme.muted_text};
-        font-size: 13px;
+        font-size: 12px;
         font-weight: 600;
     }}
     QLabel#dashboardCardValue {{
         color: {theme.text};
-        font-size: 28px;
+        font-size: 24px;
         font-weight: 700;
     }}
     QLabel {{
@@ -113,26 +167,39 @@ def build_stylesheet(theme: ThemePalette) -> str:
         background: {theme.panel_bg};
         border: 1px solid {theme.border};
         border-radius: 8px;
-        padding: 8px;
+        padding: 4px 6px;
         color: {theme.text};
         selection-background-color: {theme.button_bg};
     }}
+    QLineEdit#callsignHeroInput {{
+        font-size: 17px;
+        font-weight: 700;
+        padding: 6px 8px;
+        border-radius: 10px;
+    }}
     QTextEdit, QTableWidget, QMessageBox {{
         border-radius: 10px;
+    }}
+    QLineEdit, QComboBox {{
+        min-height: 26px;
+    }}
+    QTableWidget#denseTable {{
+        alternate-background-color: {theme.panel_alt_bg};
     }}
     QHeaderView::section {{
         background: {theme.panel_alt_bg};
         color: {theme.text};
         border: 1px solid {theme.border};
-        padding: 6px;
+        padding: 4px;
     }}
     QPushButton {{
         background: {theme.button_bg};
         color: {theme.button_text};
         border: none;
         border-radius: 8px;
-        padding: 10px 16px;
+        padding: 8px 12px;
         font-weight: 600;
+        font-size: 12px;
     }}
     QPushButton:hover {{
         background: {theme.button_hover};
@@ -141,11 +208,34 @@ def build_stylesheet(theme: ThemePalette) -> str:
         background: {theme.border};
         color: {theme.muted_text};
     }}
+    QPushButton#primaryButton {{
+        min-height: 32px;
+        font-size: 12px;
+    }}
+    QPushButton#secondaryButton {{
+        background: {theme.panel_alt_bg};
+        color: {theme.text};
+        border: 1px solid {theme.border};
+        min-height: 30px;
+    }}
+    QPushButton#secondaryButton:hover {{
+        background: {theme.panel_bg};
+    }}
+    QPushButton#dangerButton {{
+        background: #b44a4a;
+        color: #ffffff;
+    }}
+    QPushButton#dangerButton:hover {{
+        background: #983d3d;
+    }}
     QPushButton#quickFilterChip {{
         background: {theme.panel_alt_bg};
         color: {theme.text};
         border: 1px solid {theme.border};
-        padding: 6px 12px;
+        padding: 2px 6px;
+        min-height: 20px;
+        border-radius: 7px;
+        font-size: 10px;
     }}
     QPushButton#quickFilterChip:hover {{
         background: {theme.panel_bg};

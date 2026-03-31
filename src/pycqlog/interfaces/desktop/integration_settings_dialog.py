@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import secrets
+
 from PyQt6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -7,10 +9,12 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QLabel,
     QLineEdit,
+    QPushButton,
     QSpinBox,
     QVBoxLayout,
     QTabWidget,
     QWidget,
+    QHBoxLayout,
 )
 
 from pycqlog.localization import LocalizationService
@@ -36,6 +40,10 @@ class IntegrationSettingsDialog(QDialog):
         self.wsjt_enabled = QCheckBox(self._localization.t("integrations.wsjt_enabled"))
         self.wsjt_enabled.setChecked(settings.get("integration_wsjt_enabled", "false") == "true")
         wsjt_layout.addWidget(self.wsjt_enabled)
+
+        self.wsjt_debug = QCheckBox(self._localization.t("integrations.wsjt_debug"))
+        self.wsjt_debug.setChecked(settings.get("integration_wsjt_debug", "false") == "true")
+        wsjt_layout.addWidget(self.wsjt_debug)
 
         wsjt_form = QFormLayout()
         self.wsjt_host = QLineEdit(settings.get("integration_wsjt_host", "127.0.0.1"))
@@ -99,6 +107,9 @@ class IntegrationSettingsDialog(QDialog):
         self.clublog_callsign = QLineEdit(settings.get("integration_clublog_callsign", ""))
         self.clublog_api_key = QLineEdit(settings.get("integration_clublog_api_key", ""))
         self.clublog_endpoint = QLineEdit(settings.get("integration_clublog_endpoint", "https://clublog.org/realtime.php"))
+        self.clublog_delete_endpoint = QLineEdit(
+            settings.get("integration_clublog_delete_endpoint", "https://clublog.org/delete.php")
+        )
         self.clublog_interval = QSpinBox()
         self.clublog_interval.setRange(5, 600)
         self.clublog_interval.setValue(int(settings.get("integration_clublog_interval", "30") or "30"))
@@ -107,6 +118,10 @@ class IntegrationSettingsDialog(QDialog):
         clublog_form.addRow(QLabel(self._localization.t("integrations.clublog_callsign")), self.clublog_callsign)
         clublog_form.addRow(QLabel(self._localization.t("integrations.clublog_api_key")), self.clublog_api_key)
         clublog_form.addRow(QLabel(self._localization.t("integrations.clublog_endpoint")), self.clublog_endpoint)
+        clublog_form.addRow(
+            QLabel(self._localization.t("integrations.clublog_delete_endpoint")),
+            self.clublog_delete_endpoint,
+        )
         clublog_form.addRow(QLabel(self._localization.t("integrations.clublog_interval")), self.clublog_interval)
         clublog_layout.addLayout(clublog_form)
         clublog_layout.addStretch(1)
@@ -125,6 +140,41 @@ class IntegrationSettingsDialog(QDialog):
         lotw_layout.addLayout(lotw_form)
         lotw_layout.addStretch(1)
         self.tabs.addTab(lotw_tab, self._localization.t("integrations.tab_lotw"))
+
+        # Tab 5: Remote service / UI client
+        service_tab = QWidget()
+        service_layout = QVBoxLayout(service_tab)
+
+        self.service_remote_enabled = QCheckBox(self._localization.t("integrations.service_remote_enabled"))
+        self.service_remote_enabled.setChecked(settings.get("service_remote_enabled", "false") == "true")
+        service_layout.addWidget(self.service_remote_enabled)
+
+        service_form = QFormLayout()
+        self.service_remote_host = QLineEdit(settings.get("service_remote_host", "127.0.0.1"))
+        self.service_remote_port = QSpinBox()
+        self.service_remote_port.setRange(1, 65535)
+        self.service_remote_port.setValue(int(settings.get("service_remote_port", "8746") or "8746"))
+        self.service_auth_code = QLineEdit(settings.get("service_auth_code", ""))
+        self.service_auth_code.setEchoMode(QLineEdit.EchoMode.Password)
+        auth_widget = QWidget()
+        auth_row = QHBoxLayout()
+        auth_row.setContentsMargins(0, 0, 0, 0)
+        auth_row.setSpacing(8)
+        auth_row.addWidget(self.service_auth_code, 1)
+        self.generate_auth_code_button = QPushButton(self._localization.t("integrations.service_auth_generate"))
+        self.generate_auth_code_button.clicked.connect(self._generate_auth_code)
+        auth_row.addWidget(self.generate_auth_code_button)
+        auth_widget.setLayout(auth_row)
+        service_form.addRow(QLabel(self._localization.t("integrations.service_remote_host")), self.service_remote_host)
+        service_form.addRow(QLabel(self._localization.t("integrations.service_remote_port")), self.service_remote_port)
+        service_form.addRow(QLabel(self._localization.t("integrations.service_auth_code")), auth_widget)
+        service_layout.addLayout(service_form)
+
+        self.service_help_label = QLabel(self._localization.t("integrations.service_help"))
+        self.service_help_label.setWordWrap(True)
+        service_layout.addWidget(self.service_help_label)
+        service_layout.addStretch(1)
+        self.tabs.addTab(service_tab, self._localization.t("integrations.tab_service"))
 
         # Help message below tabs
         self.help_label = QLabel(self._localization.t("integrations.help"))
@@ -147,6 +197,7 @@ class IntegrationSettingsDialog(QDialog):
     def values(self) -> dict[str, str]:
         return {
             "integration_wsjt_enabled": "true" if self.wsjt_enabled.isChecked() else "false",
+            "integration_wsjt_debug": "true" if self.wsjt_debug.isChecked() else "false",
             "integration_wsjt_host": self.wsjt_host.text().strip() or "127.0.0.1",
             "integration_wsjt_port": str(self.wsjt_port.value()),
             "integration_clublog_enabled": "true" if self.clublog_enabled.isChecked() else "false",
@@ -157,6 +208,7 @@ class IntegrationSettingsDialog(QDialog):
             "integration_clublog_callsign": self.clublog_callsign.text().strip().upper(),
             "integration_clublog_api_key": self.clublog_api_key.text().strip(),
             "integration_clublog_endpoint": self.clublog_endpoint.text().strip() or "https://clublog.org/realtime.php",
+            "integration_clublog_delete_endpoint": self.clublog_delete_endpoint.text().strip() or "https://clublog.org/delete.php",
             "integration_clublog_interval": str(self.clublog_interval.value()),
             "integration_qrz_enabled": "true" if self.qrz_enabled.isChecked() else "false",
             "integration_qrz_upload_udp": "true" if self.qrz_upload_udp.isChecked() else "false",
@@ -166,4 +218,11 @@ class IntegrationSettingsDialog(QDialog):
             "integration_qrz_api_key": self.qrz_api_key.text().strip(),
             "integration_lotw_tqsl_path": self.lotw_tqsl_path.text().strip() or "tqsl",
             "integration_lotw_station_location": self.lotw_station_location.text().strip(),
+            "service_remote_enabled": "true" if self.service_remote_enabled.isChecked() else "false",
+            "service_remote_host": self.service_remote_host.text().strip() or "127.0.0.1",
+            "service_remote_port": str(self.service_remote_port.value()),
+            "service_auth_code": self.service_auth_code.text().strip(),
         }
+
+    def _generate_auth_code(self) -> None:
+        self.service_auth_code.setText(secrets.token_urlsafe(24))

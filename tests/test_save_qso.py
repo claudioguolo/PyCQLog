@@ -1,3 +1,4 @@
+import json
 from datetime import date, time
 from decimal import Decimal
 from pathlib import Path
@@ -23,11 +24,15 @@ from pycqlog.application.use_cases import (
     SearchQsosUseCase,
     SetActiveLogbookUseCase,
 )
+from pycqlog.bootstrap import _resolve_settings_store
 from pycqlog.domain.awards import extract_wpx_prefix, resolve_awards
 from pycqlog.infrastructure.adif_export import AdifExporter
-from pycqlog.infrastructure.integrations import IntegrationManager
+from pycqlog.infrastructure.app_logging import configure_app_logging
+from pycqlog.infrastructure.integrations import ClubLogConfig, IntegrationManager, build_clublog_payload
 from pycqlog.infrastructure.repositories import InMemoryQsoRepository, SQLiteQsoRepository
 from pycqlog.infrastructure.settings import JsonSettingsStore
+from pycqlog.infrastructure.station_service import StationService
+from pycqlog.infrastructure.sync_audit import audit_sync_event, parse_adif_summary
 
 
 def test_save_qso_normalizes_and_resolves_band() -> None:
@@ -292,6 +297,7 @@ def test_integration_manager_validates_and_filters_sources(tmp_path: Path) -> No
             "integration_clublog_callsign": "PY9MT",
             "integration_clublog_api_key": "secret",
             "integration_clublog_endpoint": "https://clublog.org/realtime.php",
+            "integration_clublog_delete_endpoint": "https://clublog.org/delete.php",
             "integration_clublog_upload_udp": "true",
             "integration_clublog_upload_manual": "false",
         }
@@ -304,8 +310,293 @@ def test_integration_manager_validates_and_filters_sources(tmp_path: Path) -> No
     assert detail == "Club Log ready"
     assert manager.should_upload_source("udp") is True
     assert manager.should_upload_source("manual") is False
-    assert manager.enqueue_clublog_upload("<CALL:5>PY9MT<EOR>", source="manual") is None
-    assert manager.enqueue_clublog_upload("<CALL:5>PY9MT<EOR>", source="udp") is not None
+    assert "Club Log" not in manager.enqueue_uploads("<CALL:5>PY9MT<EOR>", source="manual")
+    assert "Club Log" in manager.enqueue_uploads("<CALL:5>PY9MT<EOR>", source="udp")
+
+
+def test_integration_manager_accepts_local_clublog_mock_without_real_credentials(tmp_path: Path) -> None:
+    settings = JsonSettingsStore(tmp_path / "settings.json")
+    settings.update_many(
+        {
+            "integration_clublog_enabled": "true",
+            "integration_clublog_email": "",
+            "integration_clublog_password": "",
+            "integration_clublog_callsign": "PY9MT",
+            "integration_clublog_api_key": "",
+            "integration_clublog_endpoint": "http://127.0.0.1:8000/clublog/upload",
+            "integration_clublog_delete_endpoint": "http://127.0.0.1:8000/clublog/delete",
+            "integration_clublog_upload_udp": "true",
+            "integration_clublog_upload_manual": "true",
+        }
+    )
+    manager = IntegrationManager(settings, tmp_path / "queue.json")
+
+    ready, detail = manager.validate_clublog_config()
+
+    assert ready is True
+    assert detail == "Club Log ready"
+    assert "Club Log" in manager.enqueue_uploads("<CALL:5>PY9MT<EOR>", source="manual")
+
+
+def test_build_clublog_payload_adds_mock_defaults_for_local_endpoint() -> None:
+    config = ClubLogConfig(
+        enabled=True,
+        email="",
+        password="",
+        callsign="PY9MT",
+        api_key="",
+        endpoint="http://localhost:8000/clublog/upload",
+        delete_endpoint="http://localhost:8000/clublog/delete",
+        interval_seconds=5,
+    )
+
+    payload = build_clublog_payload(config, "<CALL:5>PY9MT<EOR>")
+
+    assert payload["email"] == "mock@example.com"
+    assert payload["password"] == "mock-password"
+    assert payload["callsign"] == "PY9MT"
+    assert payload["api"] == "mock-api-key"
+    assert payload["api_key"] == "mock-api-key"
+    assert payload["source"] == "pycqlog"
+    assert payload["format"] == "adif_realtime"
+
+
+def test_integration_manager_does_not_retry_pending_jobs_automatically_on_startup(tmp_path: Path) -> None:
+    queue_path = tmp_path / "queue.json"
+    queue_path.write_text(
+        json.dumps(
+            [
+                {
+                    "job_id": "pending-1",
+                    "config": {
+                        "enabled": True,
+                        "email": "radio@example.com",
+                        "password": "app-pass",
+                        "callsign": "PY9MT",
+                        "api_key": "secret",
+                        "endpoint": "https://clublog.org/realtime.php",
+                        "delete_endpoint": "https://clublog.org/delete.php",
+                        "interval_seconds": 10,
+                    },
+                    "adif_text": "<CALL:5>PY9MT<EOR>",
+                    "created_at": "2026-03-31T15:00:00",
+                    "signature": "sig-1",
+                }
+            ],
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    settings = JsonSettingsStore(tmp_path / "settings.json")
+
+    manager = IntegrationManager(settings, queue_path)
+
+    assert manager.pending_upload_count() == 1
+    assert manager.poll_upload_results() == []
+
+
+def test_retry_pending_uploads_removes_stale_local_jobs(tmp_path: Path) -> None:
+    queue_path = tmp_path / "queue.json"
+    queue_path.write_text(
+        json.dumps(
+            [
+                {
+                    "job_id": "pending-local",
+                    "config": {
+                        "enabled": True,
+                        "email": "",
+                        "password": "",
+                        "callsign": "PY9MT",
+                        "api_key": "",
+                        "endpoint": "http://127.0.0.1:8000/",
+                        "delete_endpoint": "http://127.0.0.1:8000/delete",
+                        "interval_seconds": 10,
+                    },
+                    "adif_text": "<CALL:5>PY9MT<EOR>",
+                    "created_at": "2026-03-31T15:00:00",
+                    "signature": "sig-local",
+                }
+            ],
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    settings = JsonSettingsStore(tmp_path / "settings.json")
+
+    manager = IntegrationManager(settings, queue_path)
+    retried = manager.retry_pending_uploads()
+
+    assert retried == 0
+    assert manager.pending_upload_count() == 0
+
+
+def test_integration_manager_blocks_new_enqueue_during_clublog_cooldown(tmp_path: Path) -> None:
+    settings = JsonSettingsStore(tmp_path / "settings.json")
+    settings.update_many(
+        {
+            "integration_clublog_enabled": "true",
+            "integration_clublog_email": "radio@example.com",
+            "integration_clublog_password": "app-pass",
+            "integration_clublog_callsign": "PY9MT",
+            "integration_clublog_api_key": "secret",
+            "integration_clublog_endpoint": "https://clublog.org/realtime.php",
+            "integration_clublog_delete_endpoint": "https://clublog.org/delete.php",
+            "integration_clublog_upload_udp": "true",
+            "integration_clublog_upload_manual": "true",
+            "integration_clublog_cooldown_until": "2099-01-01T00:00:00",
+        }
+    )
+    manager = IntegrationManager(settings, tmp_path / "queue.json")
+
+    assert manager.clublog_status()[0] is False
+    assert manager.enqueue_uploads("<CALL:5>PY9MT<EOR>", source="manual") == []
+
+
+def test_integration_manager_can_enqueue_clublog_delete(tmp_path: Path) -> None:
+    settings = JsonSettingsStore(tmp_path / "settings.json")
+    settings.update_many(
+        {
+            "integration_clublog_enabled": "true",
+            "integration_clublog_email": "radio@example.com",
+            "integration_clublog_password": "app-pass",
+            "integration_clublog_callsign": "PY9MT",
+            "integration_clublog_api_key": "secret",
+            "integration_clublog_endpoint": "https://clublog.org/realtime.php",
+            "integration_clublog_delete_endpoint": "https://clublog.org/delete.php",
+            "integration_clublog_upload_manual": "true",
+        }
+    )
+    manager = IntegrationManager(settings, tmp_path / "queue.json")
+
+    queued = manager.enqueue_clublog_delete(
+        callsign="PY2ABC",
+        qso_date="2026-03-31",
+        time_on="15:24",
+        band="10m",
+        source="manual",
+    )
+
+    assert queued is True
+    assert manager.pending_upload_count() == 1
+
+
+def test_sync_audit_writes_destination_specific_log_file(tmp_path: Path) -> None:
+    configure_app_logging(tmp_path)
+
+    audit_sync_event(
+        "clublog",
+        state="queued",
+        job_id="job-1",
+        action="insert",
+        adif_text="<CALL:6>PY2ABC<QSO_DATE:8>20260331<TIME_ON:6>152400<BAND:3>20m<MODE:3>FT8<EOR>",
+        detail="Queued for Club Log upload",
+        endpoint="https://clublog.org/realtime.php",
+    )
+
+    sync_log = tmp_path / "logs" / "sync_clublog.log"
+
+    assert sync_log.exists()
+    content = sync_log.read_text(encoding="utf-8")
+    assert "state=queued" in content
+    assert "job_id=job-1" in content
+    assert "callsign=PY2ABC" in content
+    assert "qso_date=20260331" in content
+    assert "time_on=15:24" in content
+
+
+def test_parse_adif_summary_extracts_identity_fields() -> None:
+    summary = parse_adif_summary(
+        "<CALL:6>PY2ABC<QSO_DATE:8>20260331<TIME_ON:6>152400<BAND:3>20m<MODE:3>FT8<EOR>"
+    )
+
+    assert summary == {
+        "callsign": "PY2ABC",
+        "qso_date": "20260331",
+        "time_on": "15:24",
+        "band": "20M",
+        "mode": "FT8",
+    }
+
+
+def test_station_service_processes_udp_event_and_updates_stats(tmp_path: Path) -> None:
+    repository = InMemoryQsoRepository()
+    settings = JsonSettingsStore(tmp_path / "settings.json")
+    settings.update_many(
+        {
+            "integration_wsjt_enabled": "true",
+            "integration_clublog_enabled": "false",
+            "integration_qrz_enabled": "false",
+        }
+    )
+    service = StationService(
+        settings_store=settings,
+        save_qso_use_case=SaveQsoUseCase(repository=repository),
+        get_active_logbook_use_case=GetActiveLogbookUseCase(repository=repository),
+        queue_path=tmp_path / "queue.json",
+    )
+
+    service.start()
+    try:
+        service.inject_test_logged_qso()
+        result = service.process_once()
+    finally:
+        service.stop()
+
+    recent = ListRecentQsosUseCase(repository=repository).execute(limit=10)
+
+    assert result.saved_callsigns == ["PY0TEST"]
+    assert recent[0].callsign == "PY0TEST"
+    assert service.stats()["received"] == 1
+    assert service.stats()["saved"] == 1
+    assert any(event["event"] == "QSO saved" for event in service.events())
+
+
+def test_settings_store_writes_ini_with_sections_and_comments(tmp_path: Path) -> None:
+    store = JsonSettingsStore(tmp_path / "pycqlog.conf")
+    store.update_many(
+        {
+            "language": "pt-BR",
+            "data_dir": "/tmp/data",
+            "integration_wsjt_enabled": "true",
+            "integration_clublog_endpoint": "https://clublog.org/realtime.php",
+        }
+    )
+
+    content = (tmp_path / "pycqlog.conf").read_text(encoding="utf-8")
+
+    assert "# PyCQLog configuration file" in content
+    assert "[ui]" in content
+    assert "language = pt-BR" in content
+    assert "[paths]" in content
+    assert "data_dir = /tmp/data" in content
+    assert "[wsjt]" in content
+    assert "integration_wsjt_enabled = true" in content
+    assert "[clublog]" in content
+
+
+def test_bootstrap_migrates_legacy_json_to_pycqlog_conf(tmp_path: Path) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    legacy = config_dir / "settings.json"
+    legacy.write_text(
+        json.dumps(
+            {
+                "language": "pt-BR",
+                "theme": "system",
+                "integration_wsjt_enabled": "true",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = _resolve_settings_store(config_dir)
+
+    assert store.get_string("language", "") == "pt-BR"
+    conf_path = config_dir / "pycqlog.conf"
+    assert conf_path.exists()
+    content = conf_path.read_text(encoding="utf-8")
+    assert "[ui]" in content
+    assert "[wsjt]" in content
 
 
 def test_dashboard_stats_aggregates_repository_data() -> None:

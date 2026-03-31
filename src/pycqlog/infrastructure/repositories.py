@@ -5,6 +5,7 @@ from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
 
+from pycqlog.infrastructure.app_logging import get_logger
 from pycqlog.domain.models import (
     Logbook,
     LogbookDraft,
@@ -13,6 +14,9 @@ from pycqlog.domain.models import (
     StationProfile,
     StationProfileDraft,
 )
+
+
+logger = get_logger("repositories")
 
 
 class InMemoryQsoRepository:
@@ -285,6 +289,11 @@ class SQLiteQsoRepository:
         self._active_logbook_id = active_logbook_id or 1
         self._initialize()
         self._active_logbook_id = self.get_active_logbook().id
+        logger.info(
+            "SQLite repository initialized. database_path=%s active_logbook_id=%s",
+            self._database_path,
+            self._active_logbook_id,
+        )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._database_path)
@@ -368,6 +377,7 @@ class SQLiteQsoRepository:
                 """,
                 ("Main Logbook", "Default logbook", created_at),
             )
+            logger.info("Default logbook row created.")
 
     def ensure_default_logbook(self) -> Logbook:
         return self.get_active_logbook()
@@ -473,6 +483,7 @@ class SQLiteQsoRepository:
         logbook = self.get_logbook(logbook_id)
         if logbook is None:
             raise ValueError(f"Logbook {logbook_id} not found.")
+        logger.info("Logbook saved. id=%s name=%s", logbook.id, logbook.name)
         return logbook
 
     def delete_logbook(self, logbook_id: int) -> bool:
@@ -486,6 +497,7 @@ class SQLiteQsoRepository:
                 next_row = connection.execute("SELECT id FROM logbooks ORDER BY name ASC, id ASC LIMIT 1").fetchone()
                 if next_row is not None:
                     self._active_logbook_id = int(next_row["id"])
+        logger.info("Logbook delete requested. id=%s deleted=%s", logbook_id, deleted)
         return deleted
 
     def get_active_logbook(self) -> Logbook:
@@ -503,6 +515,7 @@ class SQLiteQsoRepository:
         if logbook is None:
             raise ValueError(f"Logbook {logbook_id} not found.")
         self._active_logbook_id = logbook_id
+        logger.info("Active logbook changed. id=%s name=%s", logbook.id, logbook.name)
         return logbook
 
     def list_station_profiles(self) -> list[StationProfile]:
@@ -613,12 +626,15 @@ class SQLiteQsoRepository:
         profile = self.get_station_profile(profile_id)
         if profile is None:
             raise ValueError(f"Station profile {profile_id} not found.")
+        logger.info("Station profile saved. id=%s name=%s", profile.id, profile.name)
         return profile
 
     def delete_station_profile(self, profile_id: int) -> bool:
         with self._connect() as connection:
             cursor = connection.execute("DELETE FROM station_profiles WHERE id = ?", (profile_id,))
-        return cursor.rowcount > 0
+        deleted = cursor.rowcount > 0
+        logger.info("Station profile delete requested. id=%s deleted=%s", profile_id, deleted)
+        return deleted
 
     def save(self, draft: QsoDraft) -> Qso:
         logbook_id = draft.logbook_id or self._active_logbook_id
@@ -661,7 +677,7 @@ class SQLiteQsoRepository:
             )
             qso_id = int(cursor.lastrowid)
 
-        return Qso(
+        qso = Qso(
             id=qso_id,
             callsign=draft.callsign,
             qso_date=draft.qso_date,
@@ -678,6 +694,15 @@ class SQLiteQsoRepository:
             source=draft.source,
             created_at=draft.created_at,
         )
+        logger.info(
+            "QSO saved. id=%s callsign=%s band=%s mode=%s source=%s",
+            qso.id,
+            qso.callsign,
+            qso.band,
+            qso.mode,
+            qso.source,
+        )
+        return qso
 
     def list_all(self) -> list[Qso]:
         with self._connect() as connection:
@@ -737,6 +762,7 @@ class SQLiteQsoRepository:
     def update(self, qso_id: int, draft: QsoDraft) -> Qso | None:
         existing = self.get_by_id(qso_id)
         if existing is None:
+            logger.warning("QSO update skipped. id=%s reason=not_found", qso_id)
             return None
 
         with self._connect() as connection:
@@ -776,7 +802,7 @@ class SQLiteQsoRepository:
                 ),
             )
 
-        return Qso(
+        qso = Qso(
             id=qso_id,
             callsign=draft.callsign,
             qso_date=draft.qso_date,
@@ -793,6 +819,8 @@ class SQLiteQsoRepository:
             source=draft.source,
             created_at=existing.created_at,
         )
+        logger.info("QSO updated. id=%s callsign=%s band=%s mode=%s", qso.id, qso.callsign, qso.band, qso.mode)
+        return qso
 
     def delete(self, qso_id: int) -> bool:
         with self._connect() as connection:
@@ -800,7 +828,9 @@ class SQLiteQsoRepository:
                 "DELETE FROM qsos WHERE id = ? AND logbook_id = ?",
                 (qso_id, self._active_logbook_id),
             )
-        return cursor.rowcount > 0
+        deleted = cursor.rowcount > 0
+        logger.info("QSO delete requested. id=%s deleted=%s", qso_id, deleted)
+        return deleted
 
     def search(self, callsign: str, limit: int = 50) -> list[Qso]:
         term = callsign.strip().upper()

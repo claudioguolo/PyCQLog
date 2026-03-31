@@ -10,6 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from urllib import error, parse, request
 
+from pycqlog.infrastructure.sync_audit import audit_sync_event, parse_adif_summary
+
 
 @dataclass(slots=True)
 class QrzLogbookConfig:
@@ -79,6 +81,15 @@ class QrzUploader:
         self._save_pending_jobs()
         self._enqueue_runtime(job)
         self.start()
+        audit_sync_event(
+            "qrz",
+            state="queued",
+            job_id=job.job_id,
+            action="insert",
+            adif_text=adif_text,
+            detail="Queued for QRZ upload",
+            attempts=0,
+        )
         return job
 
     def retry_pending(self) -> int:
@@ -88,6 +99,14 @@ class QrzUploader:
                 continue
             self._enqueue_runtime(job)
             count += 1
+            audit_sync_event(
+                "qrz",
+                state="pending",
+                job_id=job.job_id,
+                action="insert",
+                adif_text=job.adif_text,
+                detail="Pending QRZ job moved back to runtime queue",
+            )
         return count
 
     def pending_count(self) -> int:
@@ -122,9 +141,41 @@ class QrzUploader:
             if result.success:
                 self._pending_jobs.pop(job.job_id, None)
                 self._save_pending_jobs()
+                audit_sync_event(
+                    "qrz",
+                    state="success",
+                    job_id=job.job_id,
+                    action="insert",
+                    adif_text=job.adif_text,
+                    detail=result.detail,
+                )
+            else:
+                audit_sync_event(
+                    "qrz",
+                    state="failed",
+                    job_id=job.job_id,
+                    action="insert",
+                    adif_text=job.adif_text,
+                    detail=result.detail,
+                )
             self._results.put(result)
 
     def _upload(self, job: QrzUploadJob) -> QrzUploadResult:
+        summary = parse_adif_summary(job.adif_text)
+        audit_sync_event(
+            "qrz",
+            state="attempt",
+            job_id=job.job_id,
+            action="insert",
+            adif_text=job.adif_text,
+            callsign=summary["callsign"],
+            qso_date=summary["qso_date"],
+            time_on=summary["time_on"],
+            band=summary["band"],
+            mode=summary["mode"],
+            endpoint="https://logbook.qrz.com/api",
+            detail="Posting QRZ logbook job",
+        )
         payload = {
             "KEY": job.config.api_key,
             "ACTION": "INSERT",

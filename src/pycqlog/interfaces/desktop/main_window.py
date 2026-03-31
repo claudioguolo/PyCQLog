@@ -9,8 +9,8 @@ from PyQt6.QtGui import QAction, QActionGroup, QColor
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
-    QComboBox,
     QFileDialog,
+    QFrame,
     QFormLayout,
     QHBoxLayout,
     QHeaderView,
@@ -24,6 +24,8 @@ from PyQt6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QSizePolicy,
+    QSplitter,
 )
 
 from pycqlog.application.dto import QsoListItem, SaveQsoCommand
@@ -49,10 +51,11 @@ from pycqlog.application.use_cases import (
     FetchCallbookInfoUseCase,
 )
 from pycqlog.domain.services import QsoValidationError
-from pycqlog.infrastructure.adif import AdifParser
 from pycqlog.infrastructure.adif_export import AdifExporter
-from pycqlog.infrastructure.integrations import IntegrationManager, LoggedAdifEvent
-from pycqlog.infrastructure.settings import JsonSettingsStore
+from pycqlog.infrastructure.app_logging import configure_app_logging, current_log_file, get_logger
+from pycqlog.infrastructure.remote_station_service import RemoteStationService
+from pycqlog.infrastructure.settings import JsonSettingsStore, UI_SETTINGS_KEYS
+from pycqlog.infrastructure.station_service import StationService
 from pycqlog.interfaces.desktop.adif_preview_dialog import AdifPreviewDialog
 from pycqlog.interfaces.desktop.adif_settings_dialog import AdifSettingsDialog
 from pycqlog.interfaces.desktop.dashboard_dialog import DashboardDialog
@@ -68,7 +71,61 @@ from pycqlog.themes import build_stylesheet, resolve_theme
 from pycqlog.ui_colors import color_for_band, color_for_mode, contrasting_text_color
 
 
+class NumericTableWidgetItem(QTableWidgetItem):
+    def __init__(self, value: int) -> None:
+        super().__init__(str(value))
+        self._numeric_value = value
+
+    def __lt__(self, other: object) -> bool:
+        if isinstance(other, NumericTableWidgetItem):
+            return self._numeric_value < other._numeric_value
+        if isinstance(other, QTableWidgetItem):
+            try:
+                return self._numeric_value < int(other.text())
+            except ValueError:
+                return super().__lt__(other)
+        return NotImplemented
+
+
+class ProportionalTableWidget(QTableWidget):
+    def __init__(self, rows: int, columns: int, column_weights: list[int]) -> None:
+        super().__init__(rows, columns)
+        self._column_weights = column_weights
+        header = self.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.apply_proportional_widths()
+
+    def apply_proportional_widths(self) -> None:
+        if not self._column_weights or len(self._column_weights) != self.columnCount():
+            return
+        available_width = max(0, self.viewport().width())
+        if available_width <= 0:
+            return
+        total_weight = sum(self._column_weights)
+        widths = [max(32, (available_width * weight) // total_weight) for weight in self._column_weights]
+        overflow = sum(widths) - available_width
+        if overflow > 0:
+            for index in range(len(widths) - 1, -1, -1):
+                reducible = widths[index] - 32
+                if reducible <= 0:
+                    continue
+                reduction = min(reducible, overflow)
+                widths[index] -= reduction
+                overflow -= reduction
+                if overflow <= 0:
+                    break
+        elif overflow < 0:
+            widths[-1] += -overflow
+        for column, width in enumerate(widths):
+            self.setColumnWidth(column, width)
+
+
 class MainWindow(QMainWindow):
+    _CONTENT_MIN_WIDTH = 760
+
     def __init__(
         self,
         save_qso: SaveQsoUseCase,
@@ -90,7 +147,8 @@ class MainWindow(QMainWindow):
         delete_station_profile: DeleteStationProfileUseCase,
         fetch_callbook_info: FetchCallbookInfoUseCase,
         localization: LocalizationService,
-        settings_store: JsonSettingsStore,
+        ui_settings_store: JsonSettingsStore,
+        daemon_settings_store: JsonSettingsStore,
         data_dir: Path,
         config_dir: Path,
     ) -> None:
@@ -114,9 +172,11 @@ class MainWindow(QMainWindow):
         self._delete_station_profile_use_case = delete_station_profile
         self._fetch_callbook_info_use_case = fetch_callbook_info
         self._localization = localization
-        self._settings_store = settings_store
+        self._ui_settings_store = ui_settings_store
+        self._daemon_settings_store = daemon_settings_store
         self._active_data_dir = data_dir
         self._config_dir = config_dir
+        self._logger = get_logger("ui.main_window")
         self._editing_qso_id: int | None = None
         self._current_status_key = "status.ready_first"
         self._current_status_params: dict[str, object] = {}
@@ -127,193 +187,263 @@ class MainWindow(QMainWindow):
         self._active_mode_filters: set[str] = set()
         self._band_filter_buttons: dict[str, QPushButton] = {}
         self._mode_filter_buttons: dict[str, QPushButton] = {}
-        self._data_dir = self._settings_store.get_string("data_dir", str(self._active_data_dir))
-        self._log_dir = self._settings_store.get_string("log_dir", self._data_dir)
-        self._theme_name = self._settings_store.get_string("theme", "system")
+        self._data_dir = self._daemon_settings_store.get_string("data_dir", str(self._active_data_dir))
+        self._log_dir = self._daemon_settings_store.get_string("log_dir", self._data_dir)
+        self._theme_name = self._ui_settings_store.get_string("theme", "system")
+        self._remote_service_enabled = False
+        self._remote_service_host = "127.0.0.1"
+        self._remote_service_port = 8746
+        self._remote_service_auth_code = ""
         self._theme_stylesheet = ""
         self._dashboard_dialog: DashboardDialog | None = None
         self._integration_monitor_dialog: IntegrationMonitorDialog | None = None
-        self._suppress_logbook_change = False
-        self._adif_parser = AdifParser()
         self._adif_exporter = AdifExporter()
-        self._integration_manager = IntegrationManager(settings_store, config_dir / "clublog_queue.json")
-        self._integration_events: list[dict[str, str]] = []
-        self._integration_stats = {
-            "received": 0,
-            "saved": 0,
-            "uploaded": 0,
-            "failed": 0,
-        }
         self._build_ui()
+        self._station_service = self._create_station_service()
         self._load_logbook_options()
         self._apply_translations()
         self._apply_saved_defaults()
-        self._integration_manager.start()
+        self._station_service.start()
         self._integration_timer = QTimer(self)
         self._integration_timer.setInterval(1200)
         self._integration_timer.timeout.connect(self._poll_integrations)
         self._integration_timer.start()
         self._load_recent_qsos()
+        self._logger.info(
+            "Main window initialized. data_dir=%s log_dir=%s log_file=%s remote_service_enabled=%s remote_service=%s:%s",
+            self._data_dir,
+            self._log_dir,
+            current_log_file(),
+            self._remote_service_enabled,
+            self._remote_service_host,
+            self._remote_service_port,
+        )
 
     def _build_ui(self) -> None:
-        self.resize(1220, 680)
+        self.resize(956, 538)
+        self.setMinimumSize(760, 490)
         self._build_menu()
 
         central = QWidget(self)
-        root = QHBoxLayout(central)
-        root.setContentsMargins(20, 20, 20, 20)
-        root.setSpacing(16)
+        central.setMinimumWidth(self._CONTENT_MIN_WIDTH)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(10)
 
-        form_panel = QWidget()
-        form_root = QVBoxLayout(form_panel)
-        form_root.setContentsMargins(0, 0, 0, 0)
-        form_root.setSpacing(16)
+        top_bar = QFrame()
+        top_bar.setObjectName("workspaceCard")
+        top_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        top_bar_root = QHBoxLayout(top_bar)
+        top_bar_root.setContentsMargins(14, 12, 14, 12)
+        top_bar_root.setSpacing(10)
+
+        hero_block = QVBoxLayout()
+        hero_block.setSpacing(2)
+        self.operation_badge_label = QLabel()
+        self.operation_badge_label.setObjectName("consoleBadge")
+        hero_block.addWidget(self.operation_badge_label, alignment=Qt.AlignmentFlag.AlignLeft)
 
         self.header_label = QLabel()
         self.header_label.setObjectName("headerLabel")
         self.header_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        form_root.addWidget(self.header_label)
+        hero_block.addWidget(self.header_label)
 
-        logbook_row = QHBoxLayout()
-        self.active_logbook_label = QLabel()
-        logbook_row.addWidget(self.active_logbook_label)
-        self.active_logbook_combo = QComboBox()
-        self.active_logbook_combo.currentIndexChanged.connect(self._handle_active_logbook_change)
-        logbook_row.addWidget(self.active_logbook_combo, 1)
-        self.manage_logbooks_button = QPushButton()
-        self.manage_logbooks_button.clicked.connect(self._open_logbooks_dialog)
-        logbook_row.addWidget(self.manage_logbooks_button)
-        form_root.addLayout(logbook_row)
+        self.console_hint_label = QLabel()
+        self.console_hint_label.setObjectName("mutedLabel")
+        self.console_hint_label.setWordWrap(True)
+        hero_block.addWidget(self.console_hint_label)
+        top_bar_root.addLayout(hero_block, 4)
 
-        self.form_layout = QFormLayout()
-        self.form_layout.setSpacing(12)
-        self.form_labels: list[QLabel] = []
+        self.top_logbook_title = QLabel()
+        self.top_logbook_title.setObjectName("summaryCardTitle")
+        self.top_logbook_value = QLabel()
+        self.top_logbook_value.setObjectName("summaryCardValue")
+        top_bar_root.addWidget(self._build_summary_card(self.top_logbook_title, self.top_logbook_value), 2)
+
+        self.top_integrations_title = QLabel()
+        self.top_integrations_title.setObjectName("summaryCardTitle")
+        self.top_integrations_value = QLabel()
+        self.top_integrations_value.setObjectName("summaryCardValue")
+        top_bar_root.addWidget(self._build_summary_card(self.top_integrations_title, self.top_integrations_value), 2)
+
+        self.top_pending_title = QLabel()
+        self.top_pending_title.setObjectName("summaryCardTitle")
+        self.top_pending_value = QLabel()
+        self.top_pending_value.setObjectName("summaryCardValue")
+        top_bar_root.addWidget(self._build_summary_card(self.top_pending_title, self.top_pending_value), 1)
+
+        root.addWidget(top_bar)
+
+        entry_card = QFrame()
+        entry_card.setObjectName("entryBarCard")
+        entry_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        entry_root = QVBoxLayout(entry_card)
+        entry_root.setContentsMargins(12, 10, 12, 10)
+        entry_root.setSpacing(6)
+
+        entry_header_row = QHBoxLayout()
+        entry_header_row.setSpacing(8)
+        self.entry_header_label = QLabel()
+        self.entry_header_label.setObjectName("sectionLabel")
+        entry_header_row.addWidget(self.entry_header_label)
+
+        self.entry_hint_label = QLabel()
+        self.entry_hint_label.setObjectName("mutedLabel")
+        self.entry_hint_label.setWordWrap(True)
+        entry_header_row.addWidget(self.entry_hint_label, 1)
+        entry_root.addLayout(entry_header_row)
+
+        self._entry_field_labels: dict[str, QLabel] = {}
+        capture_row = QHBoxLayout()
+        capture_row.setSpacing(8)
 
         self.callsign_input = QLineEdit()
+        self.callsign_input.setObjectName("callsignHeroInput")
+        self.callsign_input.setMaxLength(10)
         self.callsign_input.editingFinished.connect(self._refresh_history_from_form)
-        self._add_form_row(self.callsign_input)
+        capture_row.addWidget(self._build_entry_field("callsign", self.callsign_input, min_width=138, max_width=168), 3)
 
         self.date_input = QLineEdit()
         self.date_input.setText(date.today().isoformat())
-        self._add_form_row(self.date_input)
+        capture_row.addWidget(self._build_entry_field("date", self.date_input, min_width=112), 2)
 
         self.time_input = QLineEdit()
         self.time_input.setText(datetime.now().strftime("%H:%M"))
-        self._add_form_row(self.time_input)
+        capture_row.addWidget(self._build_entry_field("time", self.time_input, min_width=84), 1)
 
         self.freq_input = QLineEdit()
-        self._add_form_row(self.freq_input)
+        capture_row.addWidget(self._build_entry_field("frequency_mhz", self.freq_input, min_width=106), 2)
 
         self.mode_input = QLineEdit()
-        self._add_form_row(self.mode_input)
+        capture_row.addWidget(self._build_entry_field("mode", self.mode_input, min_width=92), 1)
 
         self.rst_sent_input = QLineEdit()
-        self._add_form_row(self.rst_sent_input)
+        capture_row.addWidget(self._build_entry_field("rst_sent", self.rst_sent_input, min_width=70), 1)
 
         self.rst_recv_input = QLineEdit()
-        self._add_form_row(self.rst_recv_input)
+        capture_row.addWidget(self._build_entry_field("rst_recv", self.rst_recv_input, min_width=70), 1)
 
         self.operator_input = QLineEdit()
-        self._add_form_row(self.operator_input)
-
         self.station_callsign_input = QLineEdit()
-        self._add_form_row(self.station_callsign_input)
 
-        self.notes_input = QTextEdit()
-        self.notes_input.setFixedHeight(120)
-        self._add_form_row(self.notes_input)
-
-        form_root.addLayout(self.form_layout)
-
-        button_row = QHBoxLayout()
         self.save_button = QPushButton()
+        self.save_button.setObjectName("primaryButton")
         self.save_button.clicked.connect(self._save_qso)
-        button_row.addWidget(self.save_button)
+        capture_row.addWidget(self._build_action_field(self.save_button), 1)
 
         self.clear_button = QPushButton()
+        self.clear_button.setObjectName("secondaryButton")
         self.clear_button.clicked.connect(self._reset_form)
-        button_row.addWidget(self.clear_button)
-        button_row.addStretch(1)
-        form_root.addLayout(button_row)
+        capture_row.addWidget(self._build_action_field(self.clear_button), 1)
+        entry_root.addLayout(capture_row)
 
-        self.status_label = QLabel()
-        form_root.addWidget(self.status_label)
+        notes_row = QHBoxLayout()
+        notes_row.setSpacing(8)
+        self.notes_input = QTextEdit()
+        self.notes_input.setMinimumHeight(42)
+        self.notes_input.setMaximumHeight(56)
+        notes_row.addWidget(self._build_entry_field("notes", self.notes_input), 1)
+        entry_root.addLayout(notes_row)
+        root.addWidget(entry_card)
 
-        root.addWidget(form_panel, 3)
+        center_panel = QWidget()
+        center_panel.setMinimumWidth(440)
+        center_root = QVBoxLayout(center_panel)
+        center_root.setContentsMargins(0, 0, 0, 0)
+        center_root.setSpacing(10)
 
-        list_panel = QWidget()
-        list_root = QVBoxLayout(list_panel)
-        list_root.setContentsMargins(0, 0, 0, 0)
-        list_root.setSpacing(12)
+        list_card = QFrame()
+        list_card.setObjectName("workspaceCard")
+        list_root = QVBoxLayout(list_card)
+        list_root.setContentsMargins(14, 12, 14, 12)
+        list_root.setSpacing(8)
 
+        list_header_row = QHBoxLayout()
+        list_header_col = QVBoxLayout()
+        list_header_col.setSpacing(2)
         self.recent_header = QLabel()
         self.recent_header.setObjectName("sectionLabel")
-        list_root.addWidget(self.recent_header)
+        list_header_col.addWidget(self.recent_header)
+
+        self.recent_summary_label = QLabel()
+        self.recent_summary_label.setObjectName("mutedLabel")
+        list_header_col.addWidget(self.recent_summary_label)
+        list_header_row.addLayout(list_header_col, 1)
+
+        header_actions = QHBoxLayout()
+        header_actions.setSpacing(8)
+        self.edit_button = QPushButton()
+        self.edit_button.setObjectName("secondaryButton")
+        self.edit_button.clicked.connect(self._load_selected_qso)
+        self.edit_button.setEnabled(False)
+        header_actions.addWidget(self.edit_button)
+
+        self.delete_button = QPushButton()
+        self.delete_button.setObjectName("dangerButton")
+        self.delete_button.clicked.connect(self._delete_selected_qso)
+        self.delete_button.setEnabled(False)
+        header_actions.addWidget(self.delete_button)
+        list_header_row.addLayout(header_actions)
+        list_root.addLayout(list_header_row)
 
         search_row = QHBoxLayout()
-        self.search_input = QLineEdit()
-        self.search_input.returnPressed.connect(self._search_qsos)
-        search_row.addWidget(self.search_input)
-
-        self.search_button = QPushButton()
-        self.search_button.clicked.connect(self._search_qsos)
-        search_row.addWidget(self.search_button)
-
-        self.refresh_button = QPushButton()
-        self.refresh_button.clicked.connect(self._load_recent_qsos)
-        search_row.addWidget(self.refresh_button)
-        list_root.addLayout(search_row)
-
+        search_row.setSpacing(6)
         self.quick_filters_label = QLabel()
         self.quick_filters_label.setObjectName("filterLabel")
-        list_root.addWidget(self.quick_filters_label)
+        search_row.addWidget(self.quick_filters_label)
 
         self.band_filters_row = QHBoxLayout()
+        self.band_filters_row.setSpacing(6)
         self.band_filters_label = QLabel()
+        self.band_filters_label.setObjectName("inlineFilterLabel")
         self.band_filters_row.addWidget(self.band_filters_label)
-        self.band_filters_row.addStretch(1)
-        list_root.addLayout(self.band_filters_row)
+        self.band_filters_host = QWidget()
+        self.band_filters_host.setLayout(self.band_filters_row)
+        search_row.addWidget(self.band_filters_host)
 
         self.mode_filters_row = QHBoxLayout()
+        self.mode_filters_row.setSpacing(6)
         self.mode_filters_label = QLabel()
+        self.mode_filters_label.setObjectName("inlineFilterLabel")
         self.mode_filters_row.addWidget(self.mode_filters_label)
-        self.mode_filters_row.addStretch(1)
-        list_root.addLayout(self.mode_filters_row)
+        self.mode_filters_host = QWidget()
+        self.mode_filters_host.setLayout(self.mode_filters_row)
+        search_row.addWidget(self.mode_filters_host)
 
         self.clear_filters_button = QPushButton()
         self.clear_filters_button.setObjectName("quickFilterChip")
         self.clear_filters_button.clicked.connect(self._clear_quick_filters)
-        list_root.addWidget(self.clear_filters_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        search_row.addWidget(self.clear_filters_button)
 
-        self.qso_table = QTableWidget(0, 6)
+        self.search_input = QLineEdit()
+        self.search_input.returnPressed.connect(self._search_qsos)
+        search_row.addWidget(self.search_input, 1)
+
+        self.search_button = QPushButton()
+        self.search_button.setObjectName("secondaryButton")
+        self.search_button.clicked.connect(self._search_qsos)
+        search_row.addWidget(self.search_button)
+        list_root.addLayout(search_row)
+
+        self.qso_table = ProportionalTableWidget(0, 6, [10, 24, 18, 12, 12, 12])
+        self.qso_table.setObjectName("denseTable")
         self.qso_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.qso_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.qso_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.qso_table.setAlternatingRowColors(True)
+        self.qso_table.setSortingEnabled(True)
         self.qso_table.verticalHeader().setVisible(False)
-        self.qso_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.qso_table.horizontalHeader().setHighlightSections(False)
         self.qso_table.itemSelectionChanged.connect(self._handle_selection_changed)
-        list_root.addWidget(self.qso_table)
+        list_root.addWidget(self.qso_table, 1)
+        center_root.addWidget(list_card, 1)
 
-        action_row = QHBoxLayout()
-        self.edit_button = QPushButton()
-        self.edit_button.clicked.connect(self._load_selected_qso)
-        self.edit_button.setEnabled(False)
-        action_row.addWidget(self.edit_button)
-
-        self.delete_button = QPushButton()
-        self.delete_button.clicked.connect(self._delete_selected_qso)
-        self.delete_button.setEnabled(False)
-        action_row.addWidget(self.delete_button)
-        action_row.addStretch(1)
-        list_root.addLayout(action_row)
-
-        root.addWidget(list_panel, 2)
-
-        history_panel = QWidget()
-        history_root = QVBoxLayout(history_panel)
-        history_root.setContentsMargins(0, 0, 0, 0)
-        history_root.setSpacing(12)
+        history_card = QFrame()
+        history_card.setObjectName("workspaceCard")
+        history_card.setMinimumWidth(280)
+        history_root = QVBoxLayout(history_card)
+        history_root.setContentsMargins(14, 12, 14, 12)
+        history_root.setSpacing(8)
 
         self.history_header = QLabel()
         self.history_header.setObjectName("sectionLabel")
@@ -321,20 +451,67 @@ class MainWindow(QMainWindow):
 
         self.history_summary_label = QLabel()
         self.history_summary_label.setWordWrap(True)
+        self.history_summary_label.setObjectName("mutedLabel")
         history_root.addWidget(self.history_summary_label)
 
-        self.history_table = QTableWidget(0, 6)
+        self.history_table = ProportionalTableWidget(0, 6, [10, 20, 12, 12, 12, 14])
+        self.history_table.setObjectName("denseTable")
         self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.history_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.history_table.setAlternatingRowColors(True)
         self.history_table.verticalHeader().setVisible(False)
-        self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.history_table.horizontalHeader().setHighlightSections(False)
-        history_root.addWidget(self.history_table)
+        history_root.addWidget(self.history_table, 1)
 
-        root.addWidget(history_panel, 2)
+        body_splitter = QSplitter(Qt.Orientation.Horizontal)
+        body_splitter.setChildrenCollapsible(False)
+        body_splitter.addWidget(center_panel)
+        body_splitter.addWidget(history_card)
+        body_splitter.setStretchFactor(0, 4)
+        body_splitter.setStretchFactor(1, 3)
+        body_splitter.setSizes([620, 320])
+        root.addWidget(body_splitter, 1)
+
+        footer_bar = QFrame()
+        footer_bar.setObjectName("footerStatusBar")
+        footer_root = QHBoxLayout(footer_bar)
+        footer_root.setContentsMargins(8, 6, 8, 6)
+        footer_root.setSpacing(10)
+
+        self.footer_logbook_label = QLabel()
+        self.footer_logbook_label.setObjectName("footerMeta")
+        footer_root.addWidget(self.footer_logbook_label)
+
+        self.footer_integrations_label = QLabel()
+        self.footer_integrations_label.setObjectName("footerMeta")
+        footer_root.addWidget(self.footer_integrations_label)
+
+        self.footer_pending_label = QLabel()
+        self.footer_pending_label.setObjectName("footerMeta")
+        footer_root.addWidget(self.footer_pending_label)
+
+        footer_root.addStretch(1)
+
+        self.status_label = QLabel()
+        self.status_label.setObjectName("footerStatus")
+        self.status_label.setWordWrap(True)
+        footer_root.addWidget(self.status_label, 2)
+        root.addWidget(footer_bar)
 
         self.setCentralWidget(central)
+
+    def _build_summary_card(self, title_label: QLabel, value_label: QLabel) -> QFrame:
+        frame = QFrame()
+        frame.setObjectName("summaryCard")
+        frame.setMinimumWidth(150)
+        frame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(2)
+        layout.addWidget(title_label)
+        layout.addWidget(value_label)
+        return frame
 
     def _build_menu(self) -> None:
         menu_bar = self.menuBar()
@@ -416,32 +593,71 @@ class MainWindow(QMainWindow):
             self.theme_menu.addAction(action)
             self.theme_actions[theme] = action
 
-    def _add_form_row(self, field: QWidget) -> None:
+    def _build_entry_field(
+        self,
+        key: str,
+        field: QWidget,
+        min_width: int | None = None,
+        max_width: int | None = None,
+    ) -> QWidget:
+        wrapper = QWidget()
+        wrapper.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        layout = QVBoxLayout(wrapper)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
         label = QLabel()
-        self.form_labels.append(label)
-        self.form_layout.addRow(label, field)
+        label.setObjectName("fieldHeroLabel")
+        layout.addWidget(label)
+        if min_width is not None:
+            field.setMinimumWidth(min_width)
+        if max_width is not None:
+            field.setMaximumWidth(max_width)
+        layout.addWidget(field)
+        self._entry_field_labels[key] = label
+        return wrapper
+
+    def _build_action_field(self, button: QPushButton) -> QWidget:
+        wrapper = QWidget()
+        wrapper.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        layout = QVBoxLayout(wrapper)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        spacer = QLabel(" ")
+        spacer.setObjectName("fieldHeroLabel")
+        layout.addWidget(spacer)
+        button.setMinimumWidth(104)
+        layout.addWidget(button)
+        return wrapper
 
     def _apply_translations(self) -> None:
         self.setWindowTitle(self._t("app.title"))
+        self.operation_badge_label.setText(self._t("section.operation_console"))
         self.header_label.setText(self._t("section.manual_entry"))
-        self.active_logbook_label.setText(self._t("logbooks.active"))
+        self.console_hint_label.setText(self._t("section.operation_console_hint"))
+        self.entry_header_label.setText(self._t("section.qso_capture"))
+        self.entry_hint_label.setText(self._t("section.qso_capture_hint"))
         self.recent_header.setText(self._t("section.recent_qsos"))
         self.history_header.setText(self._t("section.callsign_history"))
+        self.top_logbook_title.setText(self._t("summary.logbook"))
+        self.top_integrations_title.setText(self._t("summary.integrations"))
+        self.top_pending_title.setText(self._t("summary.pending"))
 
-        labels = [
-            self._t("label.callsign"),
-            self._t("label.date"),
-            self._t("label.time"),
-            self._t("label.frequency_mhz"),
-            self._t("label.mode"),
-            self._t("label.rst_sent"),
-            self._t("label.rst_recv"),
-            self._t("label.operator"),
-            self._t("label.station"),
-            self._t("label.notes"),
-        ]
-        for label_widget, text in zip(self.form_labels, labels, strict=False):
-            label_widget.setText(text)
+        compact_labels = {
+            "callsign": self._t("label.callsign"),
+            "date": self._t("label.date"),
+            "time": self._t("label.time"),
+            "frequency_mhz": self._t("label.frequency_mhz"),
+            "mode": self._t("label.mode"),
+            "rst_sent": self._t("label.rst_sent"),
+            "rst_recv": self._t("label.rst_recv"),
+            "operator": self._t("label.operator"),
+            "station": self._t("label.station"),
+            "notes": self._t("label.notes"),
+        }
+        for key, text in compact_labels.items():
+            label = self._entry_field_labels.get(key)
+            if label is not None:
+                label.setText(text)
 
         self.callsign_input.setPlaceholderText(self._t("placeholder.callsign"))
         self.date_input.setPlaceholderText(self._t("placeholder.date"))
@@ -458,17 +674,15 @@ class MainWindow(QMainWindow):
         self.band_filters_label.setText(self._t("filter.band"))
         self.mode_filters_label.setText(self._t("filter.mode"))
         self.clear_filters_button.setText(self._t("filter.clear"))
-        self.manage_logbooks_button.setText(self._t("button.manage_logbooks"))
-
         self.save_button.setText(
             self._t("button.update_qso") if self._editing_qso_id is not None else self._t("button.save_qso")
         )
         self.clear_button.setText(self._t("button.new_qso"))
         self.search_button.setText(self._t("button.search"))
-        self.refresh_button.setText(self._t("button.show_recent"))
         self.edit_button.setText(self._t("button.edit_selected"))
         self.delete_button.setText(self._t("button.delete_selected"))
 
+        self.recent_summary_label.setText(self._t("summary.visible_qsos", count=len(self._loaded_qso_items)))
         self.qso_table.setHorizontalHeaderLabels(
             [
                 self._t("table.recent.id"),
@@ -522,6 +736,7 @@ class MainWindow(QMainWindow):
         self._apply_theme()
         self._refresh_status_label()
         self._refresh_quick_filter_labels()
+        self._refresh_operational_summary()
         if self._last_history_callsign:
             self._refresh_history(self._last_history_callsign)
         else:
@@ -532,17 +747,17 @@ class MainWindow(QMainWindow):
 
     def _change_language(self, language: str) -> None:
         self._localization.set_language(language)
-        self._settings_store.set_language(language)
+        self._ui_settings_store.set_language(language)
         self._apply_translations()
 
     def _change_theme(self, theme: str) -> None:
         self._theme_name = theme
-        self._settings_store.set_string("theme", theme)
+        self._ui_settings_store.set_string("theme", theme)
         self._apply_translations()
 
     def _apply_saved_defaults(self) -> None:
-        operator_callsign = self._settings_store.get_string("operator_callsign", "")
-        station_callsign = self._settings_store.get_string("station_callsign", "")
+        operator_callsign = self._daemon_settings_store.get_string("operator_callsign", "")
+        station_callsign = self._daemon_settings_store.get_string("station_callsign", "")
         active_logbook = self._get_active_logbook_use_case.execute()
         if active_logbook.operator_callsign:
             operator_callsign = active_logbook.operator_callsign
@@ -554,32 +769,7 @@ class MainWindow(QMainWindow):
             self.station_callsign_input.setText(station_callsign)
 
     def _load_logbook_options(self) -> None:
-        active = self._get_active_logbook_use_case.execute()
-        logbooks = self._list_logbooks_use_case.execute()
-        self._suppress_logbook_change = True
-        self.active_logbook_combo.clear()
-        for item in logbooks:
-            self.active_logbook_combo.addItem(item.name, item.logbook_id)
-        index = max(0, self.active_logbook_combo.findData(active.logbook_id))
-        self.active_logbook_combo.setCurrentIndex(index)
-        self._suppress_logbook_change = False
-
-    def _handle_active_logbook_change(self) -> None:
-        if self._suppress_logbook_change:
-            return
-        logbook_id = self.active_logbook_combo.currentData()
-        if logbook_id is None:
-            return
-        active = self._set_active_logbook_use_case.execute(int(logbook_id))
-        self._settings_store.set_string("active_logbook_id", str(active.logbook_id))
-        self._editing_qso_id = None
-        self.operator_input.clear()
-        self.station_callsign_input.clear()
-        self._apply_saved_defaults()
-        self._load_recent_qsos()
-        self._clear_history()
-        self._refresh_dashboard_if_open()
-        self._set_status("status.logbook_changed", name=active.name)
+        self._refresh_operational_summary()
 
     def _open_logbooks_dialog(self) -> None:
         dialog = LogbooksDialog(
@@ -593,7 +783,6 @@ class MainWindow(QMainWindow):
         dialog.setStyleSheet(self._theme_stylesheet)
         dialog.exec()
         self._load_logbook_options()
-        self._handle_active_logbook_change()
 
     def _open_station_profiles_dialog(self) -> None:
         dialog = StationProfilesDialog(
@@ -610,16 +799,53 @@ class MainWindow(QMainWindow):
     def _open_integration_settings_dialog(self) -> None:
         dialog = IntegrationSettingsDialog(
             localization=self._localization,
-            settings=self._settings_store.load(),
+            settings={**self._daemon_settings_store.load(), **self._ui_settings_store.load()},
             parent=self,
         )
         dialog.setStyleSheet(self._theme_stylesheet)
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
-        self._settings_store.update_many(dialog.values())
-        self._integration_manager.reconfigure()
+        values = dialog.values()
+        ui_values = {key: value for key, value in values.items() if key in UI_SETTINGS_KEYS}
+        daemon_values = {key: value for key, value in values.items() if key not in UI_SETTINGS_KEYS or key == "service_auth_code"}
+        if ui_values:
+            self._ui_settings_store.update_many(ui_values)
+        if daemon_values:
+            self._daemon_settings_store.update_many(daemon_values)
+        self._reload_station_service()
         self._refresh_integration_monitor()
         self._show_info("settings.saved_title", "settings.saved_body")
+
+    def _create_station_service(self):
+        self._remote_service_enabled = self._ui_settings_store.get_string("service_remote_enabled", "false") == "true"
+        self._remote_service_host = self._ui_settings_store.get_string("service_remote_host", "127.0.0.1") or "127.0.0.1"
+        self._remote_service_port = int(self._ui_settings_store.get_string("service_remote_port", "8746") or "8746")
+        self._remote_service_auth_code = self._ui_settings_store.get_string("service_auth_code", "")
+        if self._remote_service_enabled:
+            return RemoteStationService(
+                self._remote_service_host,
+                self._remote_service_port,
+                self._remote_service_auth_code,
+            )
+        return StationService(
+            settings_store=self._daemon_settings_store,
+            save_qso_use_case=self._save_qso_use_case,
+            get_active_logbook_use_case=self._get_active_logbook_use_case,
+            queue_path=self._config_dir / "clublog_queue.json",
+            operator_callsign_getter=lambda: self.operator_input.text(),
+            station_callsign_getter=lambda: self.station_callsign_input.text(),
+        )
+
+    def _reload_station_service(self) -> None:
+        self._station_service.stop()
+        self._station_service = self._create_station_service()
+        self._station_service.start()
+        self._logger.info(
+            "Station service reloaded. remote_service_enabled=%s remote_service=%s:%s",
+            self._remote_service_enabled,
+            self._remote_service_host,
+            self._remote_service_port,
+        )
 
     def _open_integration_monitor_dialog(self) -> None:
         if self._integration_monitor_dialog is None:
@@ -641,49 +867,40 @@ class MainWindow(QMainWindow):
         self._integration_monitor_dialog = None
 
     def _run_integration_udp_test(self) -> None:
-        self._integration_manager.inject_test_logged_qso()
-        self._append_integration_event(
-            "PyCQLog",
-            self._t("integrations.event_test_udp"),
-            self._t("integrations.test_udp_detail"),
-        )
+        self._logger.info("Manual action: integration UDP test requested.")
+        self._station_service.inject_test_logged_qso()
         self._refresh_integration_monitor()
 
     def _run_integration_clublog_test(self) -> None:
-        queued, detail = self._integration_manager.enqueue_test_clublog_upload()
-        event_key = "integrations.event_test_clublog" if queued else "integrations.event_test_clublog_failed"
-        self._append_integration_event("Club Log", self._t(event_key), detail)
+        self._logger.info("Manual action: Club Log test requested.")
+        queued, detail = self._station_service.enqueue_test_clublog_upload()
         self._refresh_integration_monitor()
         status_key = "status.clublog_queued" if queued else "status.clublog_upload_failed"
         self._set_status(status_key, detail=detail)
 
     def _retry_pending_integrations(self) -> None:
-        count = self._integration_manager.retry_pending_uploads()
-        self._append_integration_event("Club Log", self._t("integrations.event_retry_pending"), str(count))
+        count = self._station_service.retry_pending_uploads()
+        self._logger.info("Manual action: retry pending integrations. count=%s", count)
         self._refresh_integration_monitor()
 
     def _clear_integration_monitor_history(self) -> None:
-        self._integration_events.clear()
-        self._integration_stats = {
-            "received": 0,
-            "saved": 0,
-            "uploaded": 0,
-            "failed": 0,
-        }
+        self._logger.info("Manual action: integration monitor history cleared.")
+        self._station_service.clear_history()
         self._refresh_integration_monitor()
 
     def _open_settings_dialog(self) -> None:
+        self._logger.info("Opening directories dialog.")
         dialog = DirectoriesDialog(
             localization=self._localization,
-            data_dir=self._settings_store.get_string("data_dir", str(self._active_data_dir)),
-            log_dir=self._settings_store.get_string("log_dir", self._data_dir),
+            data_dir=self._daemon_settings_store.get_string("data_dir", str(self._active_data_dir)),
+            log_dir=self._daemon_settings_store.get_string("log_dir", self._data_dir),
             parent=self,
         )
         dialog.setStyleSheet(self._theme_stylesheet)
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
 
-        self._settings_store.update_many(
+        self._daemon_settings_store.update_many(
             {
                 "data_dir": dialog.data_dir(),
                 "log_dir": dialog.log_dir(),
@@ -691,6 +908,14 @@ class MainWindow(QMainWindow):
         )
         self._data_dir = dialog.data_dir()
         self._log_dir = dialog.log_dir()
+        log_file = configure_app_logging(self._log_dir or self._data_dir or str(self._active_data_dir))
+        self._logger = get_logger("ui.main_window")
+        self._logger.info(
+            "Directories updated. data_dir=%s log_dir=%s log_file=%s",
+            self._data_dir,
+            self._log_dir,
+            log_file,
+        )
         self._show_info("settings.saved_title", "settings.saved_body")
 
     def _apply_theme(self) -> None:
@@ -702,27 +927,43 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(self._theme_stylesheet)
 
     def _show_about(self) -> None:
+        self._logger.info("Opening About dialog.")
+        try:
+            from pycqlog import __version__
+            ver = __version__
+        except ImportError:
+            try:
+                from importlib.metadata import version
+                ver = version("pycqlog")
+            except Exception:
+                ver = "0.1.0"
+                
+        body = self._t("about.body") + f"\n\nVersion: {ver}"
         self._show_message_box(
             QMessageBox.Icon.Information,
             self._t("about.title"),
-            self._t("about.body"),
+            body,
         )
 
     def _poll_integrations(self) -> None:
-        for event in self._integration_manager.poll_logged_qsos():
-            self._handle_logged_adif_event(event)
-        for service_name, success, detail in self._integration_manager.poll_upload_results():
+        result = self._station_service.process_once()
+        if result.saved_callsigns:
+            self._load_recent_qsos()
+            latest = result.saved_callsigns[-1]
+            if latest != "*":
+                self._refresh_history(latest)
+            elif self._last_history_callsign:
+                self._refresh_history(self._last_history_callsign)
+            self._refresh_dashboard_if_open()
+        for service_name, success, detail in result.upload_results:
+            self._logger.info("Integration result. service=%s success=%s detail=%s", service_name, success, detail)
             key = "status.clublog_upload_ok" if success else "status.clublog_upload_failed"
-            if success:
-                self._integration_stats["uploaded"] += 1
-                self._append_integration_event(service_name, self._t("integrations.event_uploaded"), detail)
-            else:
-                self._integration_stats["failed"] += 1
-                self._append_integration_event(service_name, self._t("integrations.event_upload_failed"), detail)
             self._set_status(key, detail=f"[{service_name}] {detail}")
         self._refresh_integration_monitor()
+        self._refresh_operational_summary()
 
     def _open_dashboard(self) -> None:
+        self._logger.info("Opening dashboard dialog.")
         if self._dashboard_dialog is None:
             self._dashboard_dialog = DashboardDialog(
                 self._localization,
@@ -739,6 +980,7 @@ class MainWindow(QMainWindow):
         self._dashboard_dialog.activateWindow()
 
     def _open_dashboard_settings_dialog(self) -> None:
+        self._logger.info("Opening dashboard settings dialog.")
         dialog = DashboardSettingsDialog(
             localization=self._localization,
             use_band_colors=self._dashboard_chart_preferences()["use_band_colors"],
@@ -749,7 +991,7 @@ class MainWindow(QMainWindow):
         dialog.setStyleSheet(self._theme_stylesheet)
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
-        self._settings_store.update_many(
+        self._ui_settings_store.update_many(
             {
                 "dashboard_use_band_colors": "true" if dialog.use_band_colors() else "false",
                 "dashboard_use_mode_colors": "true" if dialog.use_mode_colors() else "false",
@@ -767,23 +1009,24 @@ class MainWindow(QMainWindow):
 
     def _dashboard_chart_preferences(self) -> dict[str, bool]:
         return {
-            "use_band_colors": self._settings_store.get_string("dashboard_use_band_colors", "true") == "true",
-            "use_mode_colors": self._settings_store.get_string("dashboard_use_mode_colors", "true") == "true",
-            "colorize_tables": self._settings_store.get_string("dashboard_colorize_tables", "true") == "true",
+            "use_band_colors": self._ui_settings_store.get_string("dashboard_use_band_colors", "true") == "true",
+            "use_mode_colors": self._ui_settings_store.get_string("dashboard_use_mode_colors", "true") == "true",
+            "colorize_tables": self._ui_settings_store.get_string("dashboard_colorize_tables", "true") == "true",
         }
 
     def _open_adif_settings_dialog(self) -> None:
+        self._logger.info("Opening ADIF settings dialog.")
         dialog = AdifSettingsDialog(
             localization=self._localization,
-            operator_callsign=self._settings_store.get_string("operator_callsign", ""),
-            station_callsign=self._settings_store.get_string("station_callsign", ""),
-            export_prefix=self._settings_store.get_string("adif_export_prefix", "pycqlog_export"),
+            operator_callsign=self._daemon_settings_store.get_string("operator_callsign", ""),
+            station_callsign=self._daemon_settings_store.get_string("station_callsign", ""),
+            export_prefix=self._daemon_settings_store.get_string("adif_export_prefix", "pycqlog_export"),
             parent=self,
         )
         dialog.setStyleSheet(self._theme_stylesheet)
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
-        self._settings_store.update_many(
+        self._daemon_settings_store.update_many(
             {
                 "operator_callsign": dialog.operator_callsign(),
                 "station_callsign": dialog.station_callsign(),
@@ -794,6 +1037,7 @@ class MainWindow(QMainWindow):
         self._show_info("settings.saved_title", "settings.saved_body")
 
     def _import_adif(self) -> None:
+        self._logger.info("Manual action: import ADIF requested.")
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             self._t("adif.dialog_title"),
@@ -801,15 +1045,18 @@ class MainWindow(QMainWindow):
             "ADIF (*.adi *.adif);;All files (*)",
         )
         if not file_path:
+            self._logger.info("ADIF import canceled by user.")
             return
 
         self._log_dir = str(Path(file_path).expanduser().parent)
-        self._settings_store.set_string("log_dir", self._log_dir)
+        self._daemon_settings_store.set_string("log_dir", self._log_dir)
 
         preview = self._import_adif_use_case.preview(Path(file_path))
+        self._logger.info("ADIF preview loaded. file=%s records=%s", file_path, len(preview.records))
         dialog = AdifPreviewDialog(self._localization, preview, parent=self)
         dialog.setStyleSheet(self._theme_stylesheet)
         if dialog.exec() != dialog.DialogCode.Accepted:
+            self._logger.info("ADIF import preview canceled. file=%s", file_path)
             return
 
         result = self._import_adif_use_case.execute(
@@ -818,6 +1065,13 @@ class MainWindow(QMainWindow):
             overrides=dialog.edited_values(),
         )
         self._load_recent_qsos()
+        self._logger.info(
+            "ADIF import finished. file=%s imported=%s skipped=%s failed=%s",
+            file_path,
+            result.imported_count,
+            result.skipped_count,
+            result.failed_count,
+        )
         self._set_status(
             "status.adif_imported",
             imported=result.imported_count,
@@ -839,81 +1093,17 @@ class MainWindow(QMainWindow):
         )
         self._refresh_dashboard_if_open()
 
-    def _handle_logged_adif_event(self, event: LoggedAdifEvent) -> None:
-        self._integration_stats["received"] += 1
-        self._append_integration_event(event.source_app, self._t("integrations.event_received"), event.adif_text[:140])
-        records = self._adif_parser.parse(event.adif_text)
-        if not records:
-            self._integration_stats["failed"] += 1
-            self._append_integration_event(event.source_app, self._t("integrations.event_parse_failed"), event.adif_text[:140])
-            self._set_status("status.integration_parse_failed", source=event.source_app)
-            return
-        record = records[0]
-        try:
-            command = SaveQsoCommand(
-                callsign=record.get("CALL"),
-                qso_date=datetime.strptime(record.get("QSO_DATE"), "%Y%m%d").date(),
-                time_on=self._parse_integration_time(record.get("TIME_ON")),
-                freq=Decimal(record.get("FREQ")),
-                mode=record.get("SUBMODE") or record.get("MODE"),
-                rst_sent=record.get("RST_SENT"),
-                rst_recv=record.get("RST_RCVD"),
-                operator=record.get("OPERATOR") or self.operator_input.text(),
-                station_callsign=record.get("STATION_CALLSIGN") or self.station_callsign_input.text(),
-                notes=record.get("COMMENT"),
-                source=self._integration_source(event.source_app),
-            )
-            result = self._save_qso_use_case.execute(command)
-        except (ValueError, InvalidOperation, QsoValidationError) as exc:
-            self._integration_stats["failed"] += 1
-            self._append_integration_event(event.source_app, self._t("integrations.event_save_failed"), str(exc))
-            self._set_status("status.integration_save_failed", source=event.source_app, detail=str(exc))
-            return
-
-        self._integration_stats["saved"] += 1
-        self._append_integration_event(
-            event.source_app,
-            self._t("integrations.event_saved"),
-            f"{result.callsign} {result.band} {result.mode}",
-        )
-        self._load_recent_qsos()
-        self._refresh_history(result.callsign)
-        self._refresh_dashboard_if_open()
-        self._set_status(
-            "status.integration_logged",
-            source=event.source_app,
-            callsign=result.callsign,
-            band=result.band,
-            mode=result.mode,
-        )
-        enqueued_services = self._integration_manager.enqueue_uploads(event.adif_text, source="udp")
-        for svc in enqueued_services:
-            self._append_integration_event(svc, self._t("integrations.event_queued"), result.callsign)
-        self._refresh_integration_monitor()
-
-    def _parse_integration_time(self, value: str):
-        normalized = value.strip().replace(":", "")
-        if len(normalized) < 4:
-            raise ValueError("Invalid TIME_ON from integration.")
-        normalized = normalized[:6].ljust(6, "0")
-        return datetime.strptime(normalized, "%H%M%S").time()
-
-    def _integration_source(self, source_app: str) -> str:
-        upper = source_app.upper()
-        if "JTDX" in upper:
-            return "jtdx_udp"
-        if "WSJT" in upper:
-            return "wsjtx_udp"
-        return "udp_integration"
-
     def _export_adif(self) -> None:
+        self._logger.info("Manual action: export ADIF requested.")
         filter_dialog = ExportAdifDialog(self._localization, parent=self)
         filter_dialog.setStyleSheet(self._theme_stylesheet)
         if filter_dialog.exec() != filter_dialog.DialogCode.Accepted:
+            self._logger.info("ADIF export canceled by user.")
             return
         try:
             export_filter = filter_dialog.export_filter()
         except ValueError as exc:
+            self._logger.warning("ADIF export filter invalid. detail=%s", exc)
             self._show_message_box(
                 QMessageBox.Icon.Warning,
                 self._t("message.invalid_data_title"),
@@ -922,7 +1112,7 @@ class MainWindow(QMainWindow):
             return
 
         default_dir = Path(self._log_dir or self._data_dir or str(self._active_data_dir))
-        export_prefix = self._settings_store.get_string("adif_export_prefix", "pycqlog_export")
+        export_prefix = self._daemon_settings_store.get_string("adif_export_prefix", "pycqlog_export")
         default_name = f"{export_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.adi"
         file_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -931,10 +1121,16 @@ class MainWindow(QMainWindow):
             "ADIF (*.adi *.adif);;All files (*)",
         )
         if not file_path:
+            self._logger.info("ADIF export save dialog canceled.")
             return
         result = self._export_adif_use_case.execute(Path(file_path), filters=export_filter)
         self._log_dir = str(Path(file_path).expanduser().parent)
-        self._settings_store.set_string("log_dir", self._log_dir)
+        self._daemon_settings_store.set_string("log_dir", self._log_dir)
+        self._logger.info(
+            "ADIF export finished. file=%s exported=%s",
+            file_path,
+            result.exported_count,
+        )
         self._set_status("status.adif_exported", exported=result.exported_count)
         self._show_message_box(
             QMessageBox.Icon.Information,
@@ -983,8 +1179,8 @@ class MainWindow(QMainWindow):
                 return
                 
             runner = TqslRunner(
-                executable_path=self._settings_store.get_string("integration_lotw_tqsl_path", "tqsl"),
-                station_location=self._settings_store.get_string("integration_lotw_station_location", "")
+                executable_path=self._daemon_settings_store.get_string("integration_lotw_tqsl_path", "tqsl"),
+                station_location=self._daemon_settings_store.get_string("integration_lotw_station_location", "")
             )
             success, detail = runner.build_tq8(temp_adif_path, Path(file_path))
             
@@ -1003,6 +1199,12 @@ class MainWindow(QMainWindow):
                 pass
 
     def _save_qso(self) -> None:
+        self._logger.info("Manual action: save QSO requested. editing_qso_id=%s", self._editing_qso_id)
+        existing_detail = (
+            self._get_qso_detail_use_case.execute(self._editing_qso_id)
+            if self._editing_qso_id is not None
+            else None
+        )
         try:
             command = SaveQsoCommand(
                 callsign=self.callsign_input.text(),
@@ -1019,6 +1221,7 @@ class MainWindow(QMainWindow):
                 qso_id=self._editing_qso_id,
             )
         except ValueError as exc:
+            self._logger.warning("QSO save failed due to invalid value. detail=%s", exc)
             self._show_message_box(
                 QMessageBox.Icon.Warning,
                 self._t("message.invalid_data_title"),
@@ -1026,6 +1229,7 @@ class MainWindow(QMainWindow):
             )
             return
         except InvalidOperation:
+            self._logger.warning("QSO save failed due to invalid frequency.")
             self._show_message_box(
                 QMessageBox.Icon.Warning,
                 self._t("message.invalid_data_title"),
@@ -1037,6 +1241,7 @@ class MainWindow(QMainWindow):
         try:
             result = self._save_qso_use_case.execute(command)
         except QsoValidationError as exc:
+            self._logger.warning("QSO save failed validation. detail=%s", exc)
             self._show_message_box(
                 QMessageBox.Icon.Warning,
                 self._t("message.validation_error_title"),
@@ -1045,6 +1250,14 @@ class MainWindow(QMainWindow):
             return
 
         action_key = "action.updated" if self._editing_qso_id is not None else "action.saved"
+        self._logger.info(
+            "QSO save succeeded. qso_id=%s callsign=%s band=%s mode=%s is_new=%s",
+            result.qso_id,
+            result.callsign,
+            result.band,
+            result.mode,
+            is_new_qso,
+        )
         warning_text = ""
         if result.warnings:
             warning_text = " " + "; ".join(result.warnings)
@@ -1087,23 +1300,58 @@ class MainWindow(QMainWindow):
                 logbook_id=result.logbook_id,
                 qso_id=result.qso_id,
             )
-            enqueued_services = self._integration_manager.enqueue_uploads(adif_text, source="manual")
-            for svc in enqueued_services:
-                self._append_integration_event(svc, self._t("integrations.event_queued"), result.callsign)
+            enqueued_services = self._station_service.enqueue_uploads(adif_text, source="manual")
+            if enqueued_services:
+                self._logger.info("Manual QSO queued for integrations. services=%s callsign=%s", ",".join(enqueued_services), result.callsign)
             self._refresh_integration_monitor()
+        elif existing_detail is not None:
+            new_adif_text = self._build_adif_record_text(
+                callsign=result.callsign,
+                qso_date=command.qso_date,
+                time_on=command.time_on,
+                freq=command.freq,
+                band=result.band,
+                mode=result.mode,
+                rst_sent=command.rst_sent,
+                rst_recv=command.rst_recv,
+                operator=command.operator,
+                station_callsign=command.station_callsign,
+                notes=command.notes,
+                source="manual",
+                logbook_id=result.logbook_id,
+                qso_id=result.qso_id,
+            )
+            queued_actions = self._station_service.enqueue_clublog_update(
+                old_callsign=existing_detail.callsign,
+                old_qso_date=existing_detail.qso_date.isoformat(),
+                old_time_on=existing_detail.time_on.strftime("%H:%M"),
+                old_band=existing_detail.band,
+                new_adif_text=new_adif_text,
+                source="manual",
+            )
+            if queued_actions:
+                self._logger.info(
+                    "Manual QSO update queued for Club Log. actions=%s callsign=%s",
+                    ",".join(queued_actions),
+                    result.callsign,
+                )
+                self._refresh_integration_monitor()
 
     def _load_recent_qsos(self) -> None:
         items = self._list_recent_qsos_use_case.execute(limit=20)
+        self._logger.debug("Recent QSOs loaded. count=%s", len(items))
         self.search_input.clear()
         self._set_visible_qso_items(items)
 
     def _search_qsos(self) -> None:
         items = self._search_qsos_use_case.execute(self.search_input.text(), limit=50)
+        self._logger.info("QSO search executed. term=%s count=%s", self.search_input.text().strip(), len(items))
         self._set_visible_qso_items(items)
         self._set_status("status.search_loaded", count=len(items))
 
     def _set_visible_qso_items(self, items: list[QsoListItem]) -> None:
         self._loaded_qso_items = items
+        self.recent_summary_label.setText(self._t("summary.visible_qsos", count=len(items)))
         self._sync_quick_filter_options(items)
         self._populate_table(self._filtered_qso_items())
 
@@ -1147,7 +1395,7 @@ class MainWindow(QMainWindow):
         active_filters: set[str],
         toggle_handler,
     ) -> None:
-        while layout.count() > 2:
+        while layout.count() > 1:
             item = layout.takeAt(1)
             widget = item.widget()
             if widget is not None:
@@ -1164,6 +1412,7 @@ class MainWindow(QMainWindow):
             button_map[value] = button
             insert_at += 1
         label.setVisible(bool(values))
+        layout.parentWidget().setVisible(bool(values))
         self.clear_filters_button.setVisible(bool(values))
 
     def _toggle_band_filter(self, band: str) -> None:
@@ -1198,25 +1447,28 @@ class MainWindow(QMainWindow):
         band_suffix = ""
         mode_suffix = ""
         if self._active_band_filters:
-            band_suffix = f" ({', '.join(sorted(self._active_band_filters))})"
+            band_suffix = f": {','.join(sorted(self._active_band_filters))}"
         if self._active_mode_filters:
-            mode_suffix = f" ({', '.join(sorted(self._active_mode_filters))})"
+            mode_suffix = f": {','.join(sorted(self._active_mode_filters))}"
         self.band_filters_label.setText(self._t("filter.band") + band_suffix)
         self.mode_filters_label.setText(self._t("filter.mode") + mode_suffix)
         has_any_filters = bool(self._active_band_filters or self._active_mode_filters)
         self.clear_filters_button.setEnabled(has_any_filters)
 
     def _populate_table(self, items: list[QsoListItem]) -> None:
+        self.recent_summary_label.setText(self._t("summary.visible_qsos", count=len(items)))
+        self.qso_table.setSortingEnabled(False)
         self.qso_table.setRowCount(len(items))
         for row_index, item in enumerate(items):
-            self._set_table_item(row_index, 0, str(item.qso_id))
+            self._set_table_item(row_index, 0, item.qso_id)
             self._set_table_item(row_index, 1, item.callsign)
             self._set_table_item(row_index, 2, item.qso_date.isoformat())
             self._set_table_item(row_index, 3, item.time_on.strftime("%H:%M"))
             self._set_table_item(row_index, 4, item.band)
             self._set_table_item(row_index, 5, item.mode)
             self._apply_qso_row_colors(row_index, item.band, item.mode)
-        self.qso_table.resizeColumnsToContents()
+        self.qso_table.apply_proportional_widths()
+        self.qso_table.setSortingEnabled(True)
         self._handle_selection_changed()
 
     def _handle_selection_changed(self) -> None:
@@ -1237,8 +1489,10 @@ class MainWindow(QMainWindow):
         qso_id = self._selected_qso_id()
         if qso_id is None:
             return
+        self._logger.info("Loading selected QSO. qso_id=%s", qso_id)
         detail = self._get_qso_detail_use_case.execute(qso_id)
         if detail is None:
+            self._logger.warning("Selected QSO not found. qso_id=%s", qso_id)
             self._show_message_box(
                 QMessageBox.Icon.Warning,
                 self._t("message.qso_not_found_title"),
@@ -1267,29 +1521,47 @@ class MainWindow(QMainWindow):
         qso_id = self._selected_qso_id()
         if qso_id is None:
             return
+        self._logger.info("Delete selected QSO requested. qso_id=%s", qso_id)
+        existing_detail = self._get_qso_detail_use_case.execute(qso_id)
         answer = self._show_question(
             self._t("message.delete_title"),
             self._t("message.delete_body", qso_id=qso_id),
         )
         if answer != QMessageBox.StandardButton.Yes:
+            self._logger.info("QSO delete canceled by user. qso_id=%s", qso_id)
             return
         deleted = self._delete_qso_use_case.execute(qso_id)
         if not deleted:
+            self._logger.warning("QSO delete failed. qso_id=%s", qso_id)
             self._show_message_box(
                 QMessageBox.Icon.Warning,
                 self._t("message.delete_failed_title"),
                 self._t("message.delete_failed_body", qso_id=qso_id),
             )
             return
+        self._logger.info("QSO deleted. qso_id=%s", qso_id)
         if self._editing_qso_id == qso_id:
             self._reset_form()
         self._load_recent_qsos()
         self._set_status("status.deleted", qso_id=qso_id)
         self._refresh_history_from_form()
         self._refresh_dashboard_if_open()
+        if existing_detail is not None and self._station_service.enqueue_clublog_delete(
+            callsign=existing_detail.callsign,
+            qso_date=existing_detail.qso_date.isoformat(),
+            time_on=existing_detail.time_on.strftime("%H:%M"),
+            band=existing_detail.band,
+            source="manual",
+        ):
+            self._logger.info("Manual QSO delete queued for Club Log. callsign=%s qso_id=%s", existing_detail.callsign, qso_id)
+            self._refresh_integration_monitor()
 
-    def _set_table_item(self, row: int, column: int, value: str) -> None:
-        self.qso_table.setItem(row, column, QTableWidgetItem(value))
+    def _set_table_item(self, row: int, column: int, value: int | str) -> None:
+        if column == 0:
+            item = NumericTableWidgetItem(int(value))
+        else:
+            item = QTableWidgetItem(str(value))
+        self.qso_table.setItem(row, column, item)
 
     def _apply_qso_row_colors(self, row: int, band: str, mode: str) -> None:
         if not self._dashboard_chart_preferences()["colorize_tables"]:
@@ -1298,6 +1570,7 @@ class MainWindow(QMainWindow):
         self._apply_cell_color(self.qso_table.item(row, 5), color_for_mode(mode), bool(mode))
 
     def _reset_form(self) -> None:
+        self._logger.debug("QSO form reset.")
         self._editing_qso_id = None
         self.callsign_input.clear()
         self.freq_input.clear()
@@ -1324,8 +1597,10 @@ class MainWindow(QMainWindow):
         if self._editing_qso_id is not None:
             return
             
+        self._logger.info("Callbook lookup requested. callsign=%s", callsign.strip().upper())
         info = self._fetch_callbook_info_use_case.execute(callsign)
         if info:
+            self._logger.info("Callbook lookup succeeded. callsign=%s", callsign.strip().upper())
             current_notes = self.notes_input.toPlainText()
             notes_parts = []
             if info.name and f"Name: {info.name}" not in current_notes:
@@ -1363,13 +1638,14 @@ class MainWindow(QMainWindow):
             if self._dashboard_chart_preferences()["colorize_tables"]:
                 self._apply_cell_color(self.history_table.item(row_index, 3), color_for_band(item.band), bool(item.band))
                 self._apply_cell_color(self.history_table.item(row_index, 4), color_for_mode(item.mode), bool(item.mode))
+        self.history_table.apply_proportional_widths()
         if items:
             self.history_summary_label.setText(
                 self._t("status.history_found", count=len(items), callsign=normalized)
             )
         else:
             self.history_summary_label.setText(self._t("status.history_empty", callsign=normalized))
-        self.history_table.resizeColumnsToContents()
+        self._refresh_operational_summary()
 
     def _set_history_item(self, row: int, column: int, value: str) -> None:
         self.history_table.setItem(row, column, QTableWidgetItem(value))
@@ -1389,14 +1665,57 @@ class MainWindow(QMainWindow):
         self._last_history_count = 0
         self.history_table.setRowCount(0)
         self.history_summary_label.setText(self._t("status.history_prompt"))
+        self._refresh_operational_summary()
 
     def _set_status(self, key: str, **params: object) -> None:
         self._current_status_key = key
         self._current_status_params = params
+        self._logger.debug("Status updated. key=%s params=%s", key, params)
         self._refresh_status_label()
 
     def _refresh_status_label(self) -> None:
         self.status_label.setText(self._t(self._current_status_key, **self._current_status_params))
+        self._refresh_operational_summary()
+
+    def _refresh_operational_summary(self) -> None:
+        try:
+            active_logbook = self._get_active_logbook_use_case.execute()
+            self.top_logbook_value.setText(active_logbook.name)
+            self.footer_logbook_label.setText(
+                self._t("summary.logbook_footer", name=active_logbook.name, count=active_logbook.qso_count)
+            )
+        except Exception:
+            self.top_logbook_value.setText("--")
+            self.footer_logbook_label.setText("--")
+
+        listener_ready, listener_detail = self._station_service.listener_status()
+        clublog_ready, clublog_detail = self._station_service.clublog_status()
+        pending_count = self._station_service.pending_upload_count()
+        integration_parts = []
+        integration_parts.append(
+            self._t("summary.integration_listener_on")
+            if listener_ready
+            else self._t("summary.integration_listener_off")
+        )
+        integration_parts.append(
+            self._t("summary.integration_cloud_on")
+            if clublog_ready
+            else self._t("summary.integration_cloud_off")
+        )
+        self.top_integrations_value.setText(" / ".join(integration_parts))
+        self.footer_integrations_label.setText(
+            self._t(
+                "summary.integrations_footer",
+                listener=listener_detail or (
+                    self._t("integrations.monitor_on") if listener_ready else self._t("integrations.monitor_off")
+                ),
+                cloud=clublog_detail or (
+                    self._t("integrations.monitor_on") if clublog_ready else self._t("integrations.monitor_off")
+                ),
+            )
+        )
+        self.top_pending_value.setText(str(pending_count))
+        self.footer_pending_label.setText(self._t("summary.pending_footer", pending=pending_count))
 
     def _show_info(self, title_key: str, body_key: str, **kwargs: object) -> None:
         self._show_message_box(
@@ -1410,6 +1729,7 @@ class MainWindow(QMainWindow):
             self._dashboard_dialog.refresh()
 
     def _show_question(self, title: str, text: str) -> QMessageBox.StandardButton:
+        self._logger.debug("Question dialog opened. title=%s text=%s", title, text)
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Question)
         box.setWindowTitle(title)
@@ -1426,6 +1746,8 @@ class MainWindow(QMainWindow):
         title: str,
         text: str,
     ) -> QMessageBox.StandardButton:
+        level = "warning" if icon == QMessageBox.Icon.Warning else "info"
+        getattr(self._logger, level)("Message dialog shown. title=%s text=%s", title, text)
         box = QMessageBox(self)
         box.setIcon(icon)
         box.setWindowTitle(title)
@@ -1434,22 +1756,12 @@ class MainWindow(QMainWindow):
         box.setStyleSheet(self._theme_stylesheet)
         return box.exec()
 
-    def _append_integration_event(self, source: str, event_name: str, detail: str) -> None:
-        self._integration_events.append(
-            {
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "source": source,
-                "event": event_name,
-                "detail": detail,
-            }
-        )
-        self._integration_events = self._integration_events[-200:]
-
     def _refresh_integration_monitor(self) -> None:
         if self._integration_monitor_dialog is None:
             return
-        listener_ready, listener_detail = self._integration_manager.listener_status()
-        clublog_ready, clublog_detail = self._integration_manager.clublog_status()
+        listener_ready, listener_detail = self._station_service.listener_status()
+        clublog_ready, clublog_detail = self._station_service.clublog_status()
+        stats = self._station_service.stats()
         self._integration_monitor_dialog.update_summary(
             {
                 "listener": (
@@ -1462,14 +1774,14 @@ class MainWindow(QMainWindow):
                     if clublog_ready and not clublog_detail
                     else clublog_detail or self._t("integrations.monitor_off")
                 ),
-                "received": str(self._integration_stats["received"]),
-                "saved": str(self._integration_stats["saved"]),
-                "uploaded": str(self._integration_stats["uploaded"]),
-                "failed": str(self._integration_stats["failed"]),
-                "pending": str(self._integration_manager.pending_upload_count()),
+                "received": str(stats["received"]),
+                "saved": str(stats["saved"]),
+                "uploaded": str(stats["uploaded"]),
+                "failed": str(stats["failed"]),
+                "pending": str(self._station_service.pending_upload_count()),
             }
         )
-        self._integration_monitor_dialog.set_events(list(reversed(self._integration_events)))
+        self._integration_monitor_dialog.set_events(list(reversed(self._station_service.events())))
 
     def _build_adif_record_text(
         self,
@@ -1510,6 +1822,7 @@ class MainWindow(QMainWindow):
         return self._adif_exporter.build_record(qso)
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        self._logger.info("Application closing.")
         self._integration_timer.stop()
-        self._integration_manager.stop()
+        self._station_service.stop()
         super().closeEvent(event)

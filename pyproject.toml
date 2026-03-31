@@ -35,6 +35,7 @@ dev = [
 
 [project.scripts]
 pycqlog = "pycqlog.main:main"
+pycqlog-service = "pycqlog.service_main:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

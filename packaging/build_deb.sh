@@ -8,18 +8,17 @@ DIST_ROOT="${PROJECT_ROOT}/dist/deb"
 PKG_ROOT="${BUILD_ROOT}/pkg"
 
 readarray -t METADATA < <(
-  PROJECT_ROOT="${PROJECT_ROOT}" python3 - <<'PY'
+  PROJECT_ROOT="${PROJECT_ROOT}" python3 -c '
 from pathlib import Path
 import os
 import tomllib
-
 project_root = Path(os.environ["PROJECT_ROOT"])
 data = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
 project = data["project"]
 print(project["name"])
 print(project["version"])
 print(project["description"])
-PY
+'
 )
 
 PACKAGE_NAME="${METADATA[0]}"

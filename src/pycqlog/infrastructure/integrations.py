@@ -2,22 +2,29 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import queue
 import socket
 import struct
 import threading
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib import error, parse, request
 
+from pycqlog.infrastructure.app_logging import get_logger
 from pycqlog.infrastructure.settings import JsonSettingsStore
 from pycqlog.infrastructure.integrations_qrz import QrzUploader, QrzLogbookConfig, QrzUploadResult, QrzUploadJob
+from pycqlog.infrastructure.sync_audit import audit_sync_event, parse_adif_summary
 
 
 WSJTX_MAGIC = 0xADBCCBDA
 WSJTX_MESSAGE_LOGGED_ADIF = 12
+CLUBLOG_FORBIDDEN_COOLDOWN_HOURS = 12
+logger = get_logger("integrations")
+jtdx_contacts_logger = get_logger("jtdx_contacts")
+clublog_uploads_logger = get_logger("clublog_uploads")
 
 
 @dataclass(slots=True)
@@ -34,16 +41,25 @@ class ClubLogConfig:
     callsign: str
     api_key: str
     endpoint: str
+    delete_endpoint: str
     interval_seconds: int
 
 
 @dataclass(slots=True)
 class ClubLogUploadJob:
     job_id: str
+    action: str
     config: ClubLogConfig
     adif_text: str
     created_at: str
     signature: str
+    delete_callsign: str = ""
+    delete_datetime: str = ""
+    delete_bandid: str = ""
+    attempts: int = 0
+    last_attempt_at: str = ""
+    next_retry_at: str = ""
+    last_error: str = ""
 
 
 @dataclass(slots=True)
@@ -51,6 +67,84 @@ class ClubLogUploadResult:
     success: bool
     detail: str
     job_id: str = ""
+    retry_after: str = ""
+
+
+def _utc_now() -> datetime:
+    return datetime.utcnow()
+
+
+def _parse_iso_datetime(raw: str) -> datetime | None:
+    value = raw.strip()
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _should_cooldown_after_failure(detail: str) -> bool:
+    upper = detail.upper()
+    return "HTTP 403" in upper or "EXCESSIVE API USAGE" in upper or "FORBIDDEN" in upper
+
+
+def is_local_clublog_endpoint(endpoint: str) -> bool:
+    try:
+        parsed = parse.urlsplit(endpoint)
+    except ValueError:
+        return False
+    hostname = (parsed.hostname or "").lower()
+    return hostname in {"localhost", "127.0.0.1", "0.0.0.0"}
+
+
+def build_clublog_payload(config: ClubLogConfig, adif_text: str) -> dict[str, str]:
+    email = config.email
+    password = config.password
+    api_key = config.api_key
+
+    if is_local_clublog_endpoint(config.endpoint):
+        email = email or "mock@example.com"
+        password = password or "mock-password"
+        api_key = api_key or "mock-api-key"
+
+    payload = {
+        "email": email,
+        "password": password,
+        "callsign": config.callsign,
+        "api": api_key,
+        "adif": adif_text,
+    }
+
+    if is_local_clublog_endpoint(config.endpoint):
+        payload["api_key"] = api_key
+        payload["source"] = "pycqlog"
+        payload["format"] = "adif_realtime"
+
+    return payload
+
+
+def encode_band_for_clublog(band: str) -> str:
+    return "".join(ch for ch in band if ch.isdigit())
+
+
+def build_clublog_delete_payload(
+    config: ClubLogConfig,
+    *,
+    callsign: str,
+    qso_date: str,
+    time_on: str,
+    band: str,
+) -> dict[str, str]:
+    return {
+        "email": config.email,
+        "password": config.password,
+        "callsign": config.callsign,
+        "api": config.api_key,
+        "dxcall": callsign.strip().upper(),
+        "datetime": f"{qso_date.strip()} {time_on.strip()}:00",
+        "bandid": encode_band_for_clublog(band.strip().upper()),
+    }
 
 
 class WsjtUdpListener:
@@ -65,13 +159,23 @@ class WsjtUdpListener:
         self._seen_hashes: list[str] = []
         self._last_error = ""
         self._bound_label = ""
+        self._debug_enabled = False
+        self._debug_queue: queue.Queue[str] = queue.Queue()
 
-    def configure(self, enabled: bool, host: str, port: int) -> None:
+    def configure(self, enabled: bool, host: str, port: int, debug_enabled: bool) -> None:
         needs_restart = enabled != self._enabled or host != self._host or port != self._port
         self._enabled = enabled
         self._host = host
         self._port = port
+        self._debug_enabled = debug_enabled
         if needs_restart:
+            logger.info(
+                "Reconfiguring UDP listener. enabled=%s host=%s port=%s debug=%s",
+                enabled,
+                host,
+                port,
+                debug_enabled,
+            )
             self.stop()
             self.start()
 
@@ -81,6 +185,7 @@ class WsjtUdpListener:
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, name="pycqlog-wsjtx-listener", daemon=True)
         self._thread.start()
+        logger.info("UDP listener thread started.")
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -93,12 +198,22 @@ class WsjtUdpListener:
         if self._thread is not None:
             self._thread.join(timeout=1.5)
             self._thread = None
+        logger.info("UDP listener stopped.")
 
     def poll(self) -> list[LoggedAdifEvent]:
         items: list[LoggedAdifEvent] = []
         while True:
             try:
                 items.append(self._events.get_nowait())
+            except queue.Empty:
+                break
+        return items
+
+    def poll_debug(self) -> list[str]:
+        items: list[str] = []
+        while True:
+            try:
+                items.append(self._debug_queue.get_nowait())
             except queue.Empty:
                 break
         return items
@@ -132,20 +247,45 @@ class WsjtUdpListener:
             self._last_error = f"Bind failed on {self._host}:{self._port}"
             self._bound_label = ""
             self._thread = None
+            logger.exception("UDP listener bind failed on %s:%s", self._host, self._port)
             return
+        logger.info("UDP listener bound on %s", self._bound_label)
 
         while not self._stop_event.is_set():
             try:
-                payload, _address = self._socket.recvfrom(65535)
+                payload, address = self._socket.recvfrom(65535)
             except TimeoutError:
                 continue
             except OSError:
                 break
+                
+            if self._debug_enabled:
+                if len(payload) >= 12:
+                    magic, schema, message_type = struct.unpack(">III", payload[:12])
+                    msg_text = f"Type {message_type}"
+                    if magic != WSJTX_MAGIC:
+                        msg_text = f"Unknown Magic: {hex(magic)} (not {hex(WSJTX_MAGIC)})"
+                    self._debug_queue.put(f"[{address[0]}:{address[1]}] {msg_text} ({len(payload)} bytes)")
+                else:
+                    self._debug_queue.put(f"[{address[0]}:{address[1]}] Small packet ({len(payload)} bytes)")
+
             event = self._parse_datagram(payload)
             if event is None:
                 continue
+            logger.debug(
+                "UDP event parsed. source=%s adif_preview=%s",
+                event.source_app,
+                event.adif_text[:120],
+            )
+            jtdx_contacts_logger.info(
+                "Contact received. source=%s from=%s adif=%s",
+                event.source_app,
+                f"{address[0]}:{address[1]}",
+                event.adif_text,
+            )
             digest = hashlib.sha1(event.adif_text.encode("utf-8", errors="ignore")).hexdigest()
             if digest in self._seen_hashes:
+                logger.debug("Skipping duplicated UDP ADIF payload. digest=%s", digest)
                 continue
             self._seen_hashes.append(digest)
             self._seen_hashes = self._seen_hashes[-100:]
@@ -156,6 +296,22 @@ class WsjtUdpListener:
             self._bound_label = ""
 
     def _parse_datagram(self, payload: bytes) -> LoggedAdifEvent | None:
+        if not payload:
+            return None
+
+        # Try fallback: Check if the packet is raw ADIF text (often used by N1MM Broadcast, JTAlert, GridTracker)
+        # Raw ADIF usually starts with < or has a clear text structure without the binary header
+        if payload[0:1] == b"<" or b"<eor>" in payload.lower() or b"<EOR>" in payload:
+            try:
+                decoded = payload.decode("utf-8", errors="ignore")
+                if "<EOR>" in decoded.upper() and ("<CALL:" in decoded.upper() or "<QSO_DATE:" in decoded.upper()):
+                    # Make sure it's not a WSJT-X binary packet that accidentally got here 
+                    # WSJT-X binary packets start with 0xADBCCBDA
+                    if not payload.startswith(struct.pack(">I", WSJTX_MAGIC)):
+                        return LoggedAdifEvent(source_app="UDP-Raw", adif_text=decoded)
+            except Exception:
+                pass
+
         if len(payload) < 16:
             return None
         magic, schema, message_type = struct.unpack(">III", payload[:12])
@@ -180,7 +336,11 @@ class ClubLogUploader:
         self._last_upload_at = 0.0
         self._pending_jobs: dict[str, ClubLogUploadJob] = self._load_pending_jobs()
         self._enqueued_ids: set[str] = set()
-        self.retry_pending()
+        logger.info(
+            "Club Log uploader initialized. queue_path=%s pending_jobs=%s",
+            queue_path,
+            len(self._pending_jobs),
+        )
 
     def start(self) -> None:
         if self._thread is not None:
@@ -188,42 +348,191 @@ class ClubLogUploader:
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, name="pycqlog-clublog-uploader", daemon=True)
         self._thread.start()
+        logger.info("Club Log uploader thread started.")
 
     def stop(self) -> None:
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=1.5)
             self._thread = None
+        logger.info("Club Log uploader stopped.")
 
     def enqueue(self, config: ClubLogConfig, adif_text: str) -> ClubLogUploadJob | None:
         if not config.enabled:
             return None
         signature = hashlib.sha1(
-            f"{config.callsign}|{config.endpoint}|{adif_text}".encode("utf-8", errors="ignore")
+            f"insert|{config.callsign}|{config.endpoint}|{adif_text}".encode("utf-8", errors="ignore")
         ).hexdigest()
         for pending in self._pending_jobs.values():
             if pending.signature == signature:
                 return pending
         job = ClubLogUploadJob(
             job_id=hashlib.sha1(f"{time.time()}:{adif_text}".encode("utf-8", errors="ignore")).hexdigest(),
+            action="insert",
             config=config,
             adif_text=adif_text,
-            created_at=datetime.utcnow().isoformat(),
+            created_at=_utc_now().isoformat(),
             signature=signature,
         )
         self._pending_jobs[job.job_id] = job
         self._save_pending_jobs()
         self._enqueue_runtime(job)
         self.start()
+        audit_sync_event(
+            "clublog",
+            state="queued",
+            job_id=job.job_id,
+            action=job.action,
+            adif_text=job.adif_text,
+            endpoint=config.endpoint,
+            detail="Queued for Club Log upload",
+            attempts=0,
+        )
+        logger.info(
+            "Club Log job enqueued. job_id=%s endpoint=%s callsign=%s pending_jobs=%s",
+            job.job_id,
+            config.endpoint,
+            config.callsign,
+            len(self._pending_jobs),
+        )
+        return job
+
+    def enqueue_delete(
+        self,
+        config: ClubLogConfig,
+        *,
+        callsign: str,
+        qso_date: str,
+        time_on: str,
+        band: str,
+    ) -> ClubLogUploadJob | None:
+        if not config.enabled:
+            return None
+        delete_callsign = callsign.strip().upper()
+        delete_datetime = f"{qso_date.strip()} {time_on.strip()}:00"
+        delete_bandid = encode_band_for_clublog(band.strip().upper())
+        signature = hashlib.sha1(
+            f"delete|{config.callsign}|{config.delete_endpoint}|{delete_callsign}|{delete_datetime}|{delete_bandid}".encode(
+                "utf-8",
+                errors="ignore",
+            )
+        ).hexdigest()
+        for pending in self._pending_jobs.values():
+            if pending.signature == signature:
+                return pending
+        job = ClubLogUploadJob(
+            job_id=hashlib.sha1(
+                f"{time.time()}:{delete_callsign}:{delete_datetime}:{delete_bandid}".encode("utf-8", errors="ignore")
+            ).hexdigest(),
+            action="delete",
+            config=config,
+            adif_text="",
+            created_at=_utc_now().isoformat(),
+            signature=signature,
+            delete_callsign=delete_callsign,
+            delete_datetime=delete_datetime,
+            delete_bandid=delete_bandid,
+        )
+        self._pending_jobs[job.job_id] = job
+        self._save_pending_jobs()
+        self._enqueue_runtime(job)
+        self.start()
+        audit_sync_event(
+            "clublog",
+            state="queued",
+            job_id=job.job_id,
+            action=job.action,
+            callsign=delete_callsign,
+            qso_date=qso_date.strip(),
+            time_on=time_on.strip(),
+            band=band.strip().upper(),
+            endpoint=config.delete_endpoint,
+            detail="Queued for Club Log delete",
+            attempts=0,
+        )
+        logger.info(
+            "Club Log delete job enqueued. job_id=%s endpoint=%s callsign=%s datetime=%s bandid=%s pending_jobs=%s",
+            job.job_id,
+            config.delete_endpoint,
+            delete_callsign,
+            delete_datetime,
+            delete_bandid,
+            len(self._pending_jobs),
+        )
         return job
 
     def retry_pending(self) -> int:
         count = 0
+        removed_job_ids: list[str] = []
         for job in self._pending_jobs.values():
             if job.job_id in self._enqueued_ids:
                 continue
+            if is_local_clublog_endpoint(job.config.endpoint):
+                removed_job_ids.append(job.job_id)
+                audit_sync_event(
+                    "clublog",
+                    state="dropped",
+                    job_id=job.job_id,
+                    action=job.action,
+                    adif_text=job.adif_text,
+                    callsign=job.delete_callsign,
+                    qso_date=job.delete_datetime.split(" ")[0] if job.delete_datetime else "",
+                    time_on=job.delete_datetime.split(" ")[1][:5] if " " in job.delete_datetime else "",
+                    band=job.delete_bandid,
+                    endpoint=job.config.endpoint,
+                    detail="Dropped stale local mock job",
+                    attempts=job.attempts,
+                )
+                logger.info(
+                    "Removing stale local Club Log job from pending queue. job_id=%s endpoint=%s",
+                    job.job_id,
+                    job.config.endpoint,
+                )
+                continue
+            next_retry_at = _parse_iso_datetime(job.next_retry_at)
+            if next_retry_at is not None and next_retry_at > _utc_now():
+                audit_sync_event(
+                    "clublog",
+                    state="cooldown",
+                    job_id=job.job_id,
+                    action=job.action,
+                    adif_text=job.adif_text,
+                    callsign=job.delete_callsign,
+                    qso_date=job.delete_datetime.split(" ")[0] if job.delete_datetime else "",
+                    time_on=job.delete_datetime.split(" ")[1][:5] if " " in job.delete_datetime else "",
+                    band=job.delete_bandid,
+                    endpoint=job.config.delete_endpoint if job.action == "delete" else job.config.endpoint,
+                    detail=f"Pending job waiting for retry after {job.next_retry_at}",
+                    attempts=job.attempts,
+                )
+                logger.info(
+                    "Skipping Club Log retry due to cooldown. job_id=%s next_retry_at=%s",
+                    job.job_id,
+                    job.next_retry_at,
+                )
+                continue
             self._enqueue_runtime(job)
             count += 1
+            audit_sync_event(
+                "clublog",
+                state="pending",
+                job_id=job.job_id,
+                action=job.action,
+                adif_text=job.adif_text,
+                callsign=job.delete_callsign,
+                qso_date=job.delete_datetime.split(" ")[0] if job.delete_datetime else "",
+                time_on=job.delete_datetime.split(" ")[1][:5] if " " in job.delete_datetime else "",
+                band=job.delete_bandid,
+                endpoint=job.config.delete_endpoint if job.action == "delete" else job.config.endpoint,
+                detail="Pending Club Log job moved back to runtime queue",
+                attempts=job.attempts,
+            )
+        for job_id in removed_job_ids:
+            self._pending_jobs.pop(job_id, None)
+        if removed_job_ids:
+            self._save_pending_jobs()
+        if count:
+            logger.info("Re-enqueued pending Club Log jobs. count=%s", count)
         return count
 
     def pending_count(self) -> int:
@@ -241,6 +550,7 @@ class ClubLogUploader:
     def _enqueue_runtime(self, job: ClubLogUploadJob) -> None:
         self._queue.put(job)
         self._enqueued_ids.add(job.job_id)
+        logger.debug("Club Log job moved to runtime queue. job_id=%s", job.job_id)
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
@@ -257,39 +567,162 @@ class ClubLogUploader:
             if result.success:
                 self._pending_jobs.pop(job.job_id, None)
                 self._save_pending_jobs()
+                audit_sync_event(
+                    "clublog",
+                    state="success",
+                    job_id=job.job_id,
+                    action=job.action,
+                    adif_text=job.adif_text,
+                    callsign=job.delete_callsign,
+                    qso_date=job.delete_datetime.split(" ")[0] if job.delete_datetime else "",
+                    time_on=job.delete_datetime.split(" ")[1][:5] if " " in job.delete_datetime else "",
+                    band=job.delete_bandid,
+                    endpoint=job.config.delete_endpoint if job.action == "delete" else job.config.endpoint,
+                    detail=result.detail,
+                    attempts=job.attempts + 1,
+                )
+                logger.info("Club Log job completed and removed from queue. job_id=%s", job.job_id)
+            else:
+                pending = self._pending_jobs.get(job.job_id)
+                if pending is not None:
+                    pending.attempts += 1
+                    pending.last_attempt_at = _utc_now().isoformat()
+                    pending.last_error = result.detail
+                    pending.next_retry_at = result.retry_after
+                    self._save_pending_jobs()
+                audit_sync_event(
+                    "clublog",
+                    state="failed",
+                    job_id=job.job_id,
+                    action=job.action,
+                    adif_text=job.adif_text,
+                    callsign=job.delete_callsign,
+                    qso_date=job.delete_datetime.split(" ")[0] if job.delete_datetime else "",
+                    time_on=job.delete_datetime.split(" ")[1][:5] if " " in job.delete_datetime else "",
+                    band=job.delete_bandid,
+                    endpoint=job.config.delete_endpoint if job.action == "delete" else job.config.endpoint,
+                    detail=result.detail,
+                    attempts=job.attempts + 1,
+                )
+                logger.warning("Club Log job failed and remains pending. job_id=%s detail=%s", job.job_id, result.detail)
             self._results.put(result)
 
     def _upload(self, job: ClubLogUploadJob) -> ClubLogUploadResult:
-        payload = {
-            "email": job.config.email,
-            "password": job.config.password,
-            "callsign": job.config.callsign,
-            "api": job.config.api_key,
-            "adif": job.adif_text,
-        }
+        if job.action == "delete":
+            payload = {
+                "email": job.config.email,
+                "password": job.config.password,
+                "callsign": job.config.callsign,
+                "api": job.config.api_key,
+                "dxcall": job.delete_callsign,
+                "datetime": job.delete_datetime,
+                "bandid": job.delete_bandid,
+            }
+            target_endpoint = job.config.delete_endpoint
+        else:
+            payload = build_clublog_payload(job.config, job.adif_text)
+            target_endpoint = job.config.endpoint
         encoded = parse.urlencode(payload).encode("utf-8")
-        req = request.Request(job.config.endpoint, data=encoded, method="POST")
+        req = request.Request(target_endpoint, data=encoded, method="POST")
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
         req.add_header("User-Agent", "PyCQLog/0.1.0")
+        summary = parse_adif_summary(job.adif_text)
+        audit_sync_event(
+            "clublog",
+            state="attempt",
+            job_id=job.job_id,
+            action=job.action,
+            adif_text=job.adif_text,
+            callsign=job.delete_callsign or summary.get("callsign", ""),
+            qso_date=job.delete_datetime.split(" ")[0] if job.delete_datetime else summary.get("qso_date", ""),
+            time_on=job.delete_datetime.split(" ")[1][:5] if " " in job.delete_datetime else summary.get("time_on", ""),
+            band=job.delete_bandid or summary.get("band", ""),
+            mode=summary.get("mode", ""),
+            endpoint=target_endpoint,
+            detail="Posting Club Log job",
+            attempts=job.attempts + 1,
+        )
+        logger.info(
+            "Posting Club Log job. job_id=%s action=%s endpoint=%s callsign=%s adif_preview=%s",
+            job.job_id,
+            job.action,
+            target_endpoint,
+            job.config.callsign,
+            job.adif_text[:120],
+        )
+        clublog_uploads_logger.info(
+            "Upload attempt. job_id=%s action=%s endpoint=%s callsign=%s attempts=%s adif=%s delete_callsign=%s delete_datetime=%s delete_bandid=%s",
+            job.job_id,
+            job.action,
+            target_endpoint,
+            job.config.callsign,
+            job.attempts + 1,
+            job.adif_text,
+            job.delete_callsign,
+            job.delete_datetime,
+            job.delete_bandid,
+        )
         try:
             with request.urlopen(req, timeout=20) as response:
                 status_code = getattr(response, "status", 200)
                 body = response.read().decode("utf-8", errors="ignore").strip()
         except error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore").strip()
+            logger.warning("Club Log HTTP error. job_id=%s action=%s code=%s detail=%s", job.job_id, job.action, exc.code, detail[:200])
+            clublog_uploads_logger.warning(
+                "Upload failed. job_id=%s action=%s status=%s endpoint=%s detail=%s",
+                job.job_id,
+                job.action,
+                exc.code,
+                target_endpoint,
+                detail[:500],
+            )
+            retry_after = ""
+            if _should_cooldown_after_failure(f"HTTP {exc.code}: {detail}"):
+                retry_after = (_utc_now() + timedelta(hours=CLUBLOG_FORBIDDEN_COOLDOWN_HOURS)).isoformat()
             return ClubLogUploadResult(
                 success=False,
                 detail=f"HTTP {exc.code}: {detail[:200] or exc.reason}",
                 job_id=job.job_id,
+                retry_after=retry_after,
             )
         except error.URLError as exc:
-            return ClubLogUploadResult(success=False, detail=str(exc), job_id=job.job_id)
+            logger.warning("Club Log URL error. job_id=%s action=%s detail=%s", job.job_id, job.action, exc)
+            clublog_uploads_logger.warning(
+                "Upload failed. job_id=%s action=%s endpoint=%s detail=%s",
+                job.job_id,
+                job.action,
+                target_endpoint,
+                str(exc),
+            )
+            return ClubLogUploadResult(success=False, detail=str(exc), job_id=job.job_id, retry_after="")
 
         body_upper = body.upper()
         looks_failed = any(token in body_upper for token in ("ERROR", "INVALID", "FAILED"))
         success = 200 <= status_code < 300 and not looks_failed
         detail = f"HTTP {status_code}: {body[:200] or 'OK'}"
-        return ClubLogUploadResult(success=success, detail=detail, job_id=job.job_id)
+        if success:
+            logger.info("Club Log upload succeeded. job_id=%s action=%s detail=%s", job.job_id, job.action, detail)
+            clublog_uploads_logger.info(
+                "Upload succeeded. job_id=%s action=%s endpoint=%s detail=%s",
+                job.job_id,
+                job.action,
+                target_endpoint,
+                detail,
+            )
+        else:
+            logger.warning("Club Log upload rejected. job_id=%s action=%s detail=%s", job.job_id, job.action, detail)
+            clublog_uploads_logger.warning(
+                "Upload rejected. job_id=%s action=%s endpoint=%s detail=%s",
+                job.job_id,
+                job.action,
+                target_endpoint,
+                detail,
+            )
+        retry_after = ""
+        if not success and _should_cooldown_after_failure(detail):
+            retry_after = (_utc_now() + timedelta(hours=CLUBLOG_FORBIDDEN_COOLDOWN_HOURS)).isoformat()
+        return ClubLogUploadResult(success=success, detail=detail, job_id=job.job_id, retry_after=retry_after)
 
     def _load_pending_jobs(self) -> dict[str, ClubLogUploadJob]:
         if not self._queue_path.exists():
@@ -304,6 +737,7 @@ class ClubLogUploader:
                 config_raw = item["config"]
                 job = ClubLogUploadJob(
                     job_id=str(item["job_id"]),
+                    action=str(item.get("action") or "insert"),
                     config=ClubLogConfig(
                         enabled=bool(config_raw["enabled"]),
                         email=str(config_raw["email"]),
@@ -311,25 +745,41 @@ class ClubLogUploader:
                         callsign=str(config_raw["callsign"]),
                         api_key=str(config_raw["api_key"]),
                         endpoint=str(config_raw["endpoint"]),
+                        delete_endpoint=str(config_raw.get("delete_endpoint") or "https://clublog.org/delete.php"),
                         interval_seconds=int(config_raw["interval_seconds"]),
                     ),
                     adif_text=str(item["adif_text"]),
                     created_at=str(item["created_at"]),
                     signature=str(item.get("signature") or ""),
+                    delete_callsign=str(item.get("delete_callsign") or ""),
+                    delete_datetime=str(item.get("delete_datetime") or ""),
+                    delete_bandid=str(item.get("delete_bandid") or ""),
+                    attempts=int(item.get("attempts") or 0),
+                    last_attempt_at=str(item.get("last_attempt_at") or ""),
+                    next_retry_at=str(item.get("next_retry_at") or ""),
+                    last_error=str(item.get("last_error") or ""),
                 )
             except (KeyError, TypeError, ValueError):
                 continue
             if not job.signature:
                 job = ClubLogUploadJob(
                     job_id=job.job_id,
+                    action=job.action,
                     config=job.config,
                     adif_text=job.adif_text,
                     created_at=job.created_at,
                     signature=hashlib.sha1(
-                        f"{job.config.callsign}|{job.config.endpoint}|{job.adif_text}".encode(
+                        f"{job.action}|{job.config.callsign}|{job.config.endpoint}|{job.adif_text}|{job.delete_callsign}|{job.delete_datetime}|{job.delete_bandid}".encode(
                             "utf-8", errors="ignore"
                         )
                     ).hexdigest(),
+                    delete_callsign=job.delete_callsign,
+                    delete_datetime=job.delete_datetime,
+                    delete_bandid=job.delete_bandid,
+                    attempts=job.attempts,
+                    last_attempt_at=job.last_attempt_at,
+                    next_retry_at=job.next_retry_at,
+                    last_error=job.last_error,
                 )
             jobs[job.job_id] = job
         return jobs
@@ -338,10 +788,18 @@ class ClubLogUploader:
         serialized = [
             {
                 "job_id": job.job_id,
+                "action": job.action,
                 "config": asdict(job.config),
                 "adif_text": job.adif_text,
                 "created_at": job.created_at,
                 "signature": job.signature,
+                "delete_callsign": job.delete_callsign,
+                "delete_datetime": job.delete_datetime,
+                "delete_bandid": job.delete_bandid,
+                "attempts": job.attempts,
+                "last_attempt_at": job.last_attempt_at,
+                "next_retry_at": job.next_retry_at,
+                "last_error": job.last_error,
             }
             for job in self._pending_jobs.values()
         ]
@@ -359,17 +817,20 @@ class IntegrationManager:
         self.reconfigure()
         self._uploader.start()
         self._qrz_uploader.start()
+        logger.info("Integration manager started.")
 
     def stop(self) -> None:
         self._listener.stop()
         self._uploader.stop()
         self._qrz_uploader.stop()
+        logger.info("Integration manager stopped.")
 
     def reconfigure(self) -> None:
         self._listener.configure(
             enabled=self._settings_store.get_string("integration_wsjt_enabled", "false") == "true",
             host=self._settings_store.get_string("integration_wsjt_host", "127.0.0.1") or "127.0.0.1",
             port=int(self._settings_store.get_string("integration_wsjt_port", "2237") or "2237"),
+            debug_enabled=self._settings_store.get_string("integration_wsjt_debug", "false") == "true",
         )
 
     def listener_enabled(self) -> bool:
@@ -389,6 +850,9 @@ class IntegrationManager:
         config = self._clublog_config()
         if not config.enabled:
             return False, ""
+        cooldown_until = self._clublog_cooldown_until()
+        if cooldown_until is not None and cooldown_until > _utc_now():
+            return False, f"Club Log cooldown active until {cooldown_until.isoformat(timespec='seconds')}"
         ready, detail = self.validate_clublog_config()
         return ready, "" if ready else detail
 
@@ -398,10 +862,19 @@ class IntegrationManager:
     def poll_logged_qsos(self) -> list[LoggedAdifEvent]:
         return self._listener.poll()
 
+    def poll_debug_messages(self) -> list[str]:
+        return self._listener.poll_debug()
+
     def poll_upload_results(self) -> list[tuple[str, bool, str]]:
         # Returns a list of (Service_Name, Success, Detail)
         items = []
         for res in self._uploader.poll_results():
+            if res.retry_after:
+                self._settings_store.set_string("integration_clublog_cooldown_until", res.retry_after)
+                logger.warning("Club Log cooldown activated until %s", res.retry_after)
+            elif res.success and self._settings_store.get_string("integration_clublog_cooldown_until", ""):
+                self._settings_store.set_string("integration_clublog_cooldown_until", "")
+                logger.info("Club Log cooldown cleared after successful upload.")
             items.append(("Club Log", res.success, res.detail))
         for res in self._qrz_uploader.poll_results():
             items.append(("QRZ", res.success, res.detail))
@@ -409,19 +882,104 @@ class IntegrationManager:
 
     def enqueue_uploads(self, adif_text: str, source: str) -> list[str]:
         queued = []
-        if self._enqueue_clublog_upload(adif_text, source):
+        if self._enqueue_clublog_insert(adif_text, source):
             queued.append("Club Log")
         if self._enqueue_qrz_upload(adif_text, source):
             queued.append("QRZ")
         return queued
 
-    def _enqueue_clublog_upload(self, adif_text: str, source: str) -> ClubLogUploadJob | None:
+    def enqueue_clublog_delete(
+        self,
+        *,
+        callsign: str,
+        qso_date: str,
+        time_on: str,
+        band: str,
+        source: str,
+    ) -> bool:
+        return self._enqueue_clublog_delete(
+            callsign=callsign,
+            qso_date=qso_date,
+            time_on=time_on,
+            band=band,
+            source=source,
+        ) is not None
+
+    def enqueue_clublog_update(
+        self,
+        *,
+        old_callsign: str,
+        old_qso_date: str,
+        old_time_on: str,
+        old_band: str,
+        new_adif_text: str,
+        source: str,
+    ) -> list[str]:
+        queued: list[str] = []
+        if self._enqueue_clublog_delete(
+            callsign=old_callsign,
+            qso_date=old_qso_date,
+            time_on=old_time_on,
+            band=old_band,
+            source=source,
+        ):
+            queued.append("Club Log delete")
+        if self._enqueue_clublog_insert(new_adif_text, source):
+            queued.append("Club Log insert")
+        return queued
+
+    def _enqueue_clublog_insert(self, adif_text: str, source: str) -> ClubLogUploadJob | None:
         config = self._clublog_config()
         if not self.should_upload_source(source):
             return None
-        if not (config.enabled and config.email and config.password and config.callsign and config.api_key):
+        if not config.enabled or not config.callsign:
+            return None
+        cooldown_until = self._clublog_cooldown_until()
+        if cooldown_until is not None and cooldown_until > _utc_now():
+            logger.warning(
+                "Skipping Club Log enqueue due to cooldown. source=%s cooldown_until=%s",
+                source,
+                cooldown_until.isoformat(timespec="seconds"),
+            )
+            return None
+        if not is_local_clublog_endpoint(config.endpoint) and not (config.email and config.password and config.api_key):
             return None
         return self._uploader.enqueue(config, adif_text)
+
+    def _enqueue_clublog_delete(
+        self,
+        *,
+        callsign: str,
+        qso_date: str,
+        time_on: str,
+        band: str,
+        source: str,
+    ) -> ClubLogUploadJob | None:
+        config = self._clublog_config()
+        if not self.should_upload_source(source):
+            return None
+        if not config.enabled or not config.callsign:
+            return None
+        cooldown_until = self._clublog_cooldown_until()
+        if cooldown_until is not None and cooldown_until > _utc_now():
+            logger.warning(
+                "Skipping Club Log delete enqueue due to cooldown. source=%s cooldown_until=%s",
+                source,
+                cooldown_until.isoformat(timespec="seconds"),
+            )
+            return None
+        if not (config.email and config.password and config.api_key):
+            return None
+        if not encode_band_for_clublog(band):
+            logger.warning("Skipping Club Log delete enqueue due to unsupported band. callsign=%s band=%s", callsign, band)
+            return None
+        return self._uploader.enqueue_delete(
+            config,
+            callsign=callsign,
+            qso_date=qso_date,
+            time_on=time_on,
+            band=band,
+        )
 
     def _enqueue_qrz_upload(self, adif_text: str, source: str) -> QrzUploadJob | None:
         normalized = source.strip().lower()
@@ -444,9 +1002,18 @@ class IntegrationManager:
         return self._qrz_uploader.enqueue(config, adif_text)
 
     def retry_pending_uploads(self) -> int:
+        cooldown_until = self._clublog_cooldown_until()
+        if cooldown_until is not None and cooldown_until > _utc_now():
+            logger.warning(
+                "Retry pending skipped due to Club Log cooldown. cooldown_until=%s",
+                cooldown_until.isoformat(timespec="seconds"),
+            )
+            return 0
         self._uploader.start()
         self._qrz_uploader.start()
-        return self._uploader.retry_pending() + self._qrz_uploader.retry_pending()
+        count = self._uploader.retry_pending() + self._qrz_uploader.retry_pending()
+        logger.info("Pending integration jobs retried. count=%s", count)
+        return count
 
     def inject_test_logged_qso(self, callsign: str = "PY0TEST") -> None:
         adif = (
@@ -463,6 +1030,7 @@ class IntegrationManager:
     def enqueue_test_clublog_upload(self) -> tuple[bool, str]:
         ready, detail = self.validate_clublog_config()
         if not ready:
+            logger.warning("Club Log test upload rejected by validation. detail=%s", detail)
             return False, detail
         config = self._clublog_config()
         adif = (
@@ -475,6 +1043,7 @@ class IntegrationManager:
             "<EOR>"
         )
         self._uploader.enqueue(config, adif)
+        logger.info("Club Log test upload enqueued.")
         return True, "Club Log test job queued."
 
     def should_upload_source(self, source: str) -> bool:
@@ -491,15 +1060,22 @@ class IntegrationManager:
             return False, "Club Log disabled."
         if not config.endpoint.startswith(("https://", "http://")):
             return False, "Club Log endpoint must start with http:// or https://."
-        if not config.email:
-            return False, "Club Log email is required."
-        if not config.password:
-            return False, "Club Log app password is required."
+        if not config.delete_endpoint.startswith(("https://", "http://")):
+            return False, "Club Log delete endpoint must start with http:// or https://."
         if not config.callsign:
             return False, "Club Log callsign is required."
-        if not config.api_key:
-            return False, "Club Log API key is required."
+        if not is_local_clublog_endpoint(config.endpoint):
+            if not config.email:
+                return False, "Club Log email is required."
+            if not config.password:
+                return False, "Club Log app password is required."
+            if not config.api_key:
+                return False, "Club Log API key is required."
         return True, "Club Log ready"
+
+    def _clublog_cooldown_until(self) -> datetime | None:
+        raw = self._settings_store.get_string("integration_clublog_cooldown_until", "")
+        return _parse_iso_datetime(raw)
 
     def _clublog_config(self) -> ClubLogConfig:
         return ClubLogConfig(
@@ -509,6 +1085,7 @@ class IntegrationManager:
             callsign=self._settings_store.get_string("integration_clublog_callsign", ""),
             api_key=self._settings_store.get_string("integration_clublog_api_key", ""),
             endpoint=self._settings_store.get_string("integration_clublog_endpoint", "https://clublog.org/realtime.php"),
+            delete_endpoint=self._settings_store.get_string("integration_clublog_delete_endpoint", "https://clublog.org/delete.php"),
             interval_seconds=max(5, int(self._settings_store.get_string("integration_clublog_interval", "30") or "30")),
         )
 

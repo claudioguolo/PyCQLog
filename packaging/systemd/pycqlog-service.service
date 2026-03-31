@@ -1,0 +1,19 @@
+[Unit]
+Description=PyCQLog headless station service
+After=network.target
+
+[Service]
+Type=simple
+User=pycqlog
+Group=pycqlog
+Environment=PYCQLOG_CONFIG_DIR=/var/lib/pycqlog/config
+Environment=PYCQLOG_DATA_DIR=/var/lib/pycqlog/data
+Environment=PYCQLOG_SERVICE_HOST=127.0.0.1
+Environment=PYCQLOG_SERVICE_PORT=8746
+ExecStart=/usr/bin/pycqlog-service
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/var/lib/pycqlog
+
+[Install]
+WantedBy=multi-user.target

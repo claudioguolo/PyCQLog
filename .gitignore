@@ -17,11 +17,30 @@ dist/
 .py4log_config/
 .py4log_data/
 docs_legacy/
+.codex
+.codex/
 
+# Local runtime data and private station state
+logs/
 *.db
 *.sqlite
 *.sqlite3
 *.log
+*.adi
+*.adif
+*.tq8
+
+# Local user configs and queues
+pycqlog.conf
+pycqlog_ui.conf
+pycqlog_daemon.conf
+settings.json
+clublog_queue.json
+qrz_queue.json
+
+# Typical copied config/data locations outside the repo tree
+.config/
+.local/
 
 .env
 .env.*

@@ -52,7 +52,8 @@ class DesktopApplication:
         delete_station_profile: DeleteStationProfileUseCase,
         fetch_callbook_info: FetchCallbookInfoUseCase,
         localization: LocalizationService,
-        settings_store: JsonSettingsStore,
+        ui_settings_store: JsonSettingsStore,
+        daemon_settings_store: JsonSettingsStore,
         data_dir: Path,
         config_dir: Path,
     ) -> None:
@@ -75,12 +76,13 @@ class DesktopApplication:
         self._delete_station_profile = delete_station_profile
         self._fetch_callbook_info = fetch_callbook_info
         self._localization = localization
-        self._settings_store = settings_store
+        self._ui_settings_store = ui_settings_store
+        self._daemon_settings_store = daemon_settings_store
         self._data_dir = data_dir
         self._config_dir = config_dir
 
-    def run(self) -> int:
-        qt_app = QApplication(sys.argv)
+    def run(self, argv: list[str] | None = None) -> int:
+        qt_app = QApplication(argv or sys.argv)
         window = MainWindow(
             save_qso=self._save_qso,
             list_recent_qsos=self._list_recent_qsos,
@@ -101,7 +103,8 @@ class DesktopApplication:
             delete_station_profile=self._delete_station_profile,
             fetch_callbook_info=self._fetch_callbook_info,
             localization=self._localization,
-            settings_store=self._settings_store,
+            ui_settings_store=self._ui_settings_store,
+            daemon_settings_store=self._daemon_settings_store,
             data_dir=self._data_dir,
             config_dir=self._config_dir,
         )
