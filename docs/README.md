@@ -15,11 +15,8 @@ O projeto e uma iniciativa de Claudio - PY9MT.
 
 ## Comece por aqui
 
-- Inicio rapido em portugues: [inicio_rapido_pt-BR.md](inicio_rapido_pt-BR.md)
 - Quick start in English: [quick_start_en.md](quick_start_en.md)
-- Guia do usuario em portugues: [guia_do_usuario_pt-BR.md](guia_do_usuario_pt-BR.md)
 - User guide in English: [user_guide_en.md](user_guide_en.md)
-- FAQ em portugues: [faq_pt-BR.md](faq_pt-BR.md)
 - FAQ in English: [faq_en.md](faq_en.md)
 
 ## Documentos tecnicos e funcionais

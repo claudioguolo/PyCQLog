@@ -80,11 +80,8 @@ O `PyCQLog` pode ser usado de tres formas principais:
 ## Documentation | Documentacao
 
 - Project docs index: [docs/README.md](docs/README.md)
-- Quick start in Portuguese: [docs/inicio_rapido_pt-BR.md](docs/inicio_rapido_pt-BR.md)
 - Quick start in English: [docs/quick_start_en.md](docs/quick_start_en.md)
-- User guide in Portuguese: [docs/guia_do_usuario_pt-BR.md](docs/guia_do_usuario_pt-BR.md)
 - User guide in English: [docs/user_guide_en.md](docs/user_guide_en.md)
-- FAQ in Portuguese: [docs/faq_pt-BR.md](docs/faq_pt-BR.md)
 - FAQ in English: [docs/faq_en.md](docs/faq_en.md)
 
 ## Installation For Development | Instalacao para Desenvolvimento
