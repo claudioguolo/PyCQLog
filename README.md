@@ -1,16 +1,50 @@
 # PyCQLog
 
-Desktop logger for amateur radio built with Python and PyQt.
+`PyCQLog` is an open source amateur radio logging application built with Python and PyQt.
 
-`PyCQLog` is a public open source application focused on practical radio operation, local-first data ownership, and an evolvable architecture for integrations such as ADIF, WSJT-X/JTDX, and Club Log.
+`PyCQLog` e um aplicativo open source de log para radioamadorismo, desenvolvido em Python e PyQt.
 
-## Why This Project Exists
+This project is an initiative led by Claudio - PY9MT.
 
-`PyCQLog` was born from the need for a modern amateur radio logging application for Linux, written in a more accessible and current language, so more volunteers can join the development effort over time.
+Este projeto e uma iniciativa de Claudio - PY9MT.
 
-The project aims to combine practical daily operation with a codebase that is easier to understand, extend, review, and maintain collaboratively.
+## Purpose | Finalidade
 
-`PyCQLog` is open to everyone who wants to contribute, develop features, test the application, use it on the air, report bugs, suggest improvements, review code, improve documentation, or help shape its direction.
+`PyCQLog` was created to offer a modern logging application for Linux that is easier to use, easier to maintain, and easier for the community to evolve over time.
+
+O `PyCQLog` foi criado para oferecer um log moderno para Linux, simples de usar no dia a dia, simples de manter e mais acessivel para evolucao colaborativa ao longo do tempo.
+
+The project focuses on three practical goals:
+
+O projeto se concentra em tres objetivos praticos:
+
+- fast daily logging for real station operation
+- local-first data ownership with simple files and SQLite
+- an architecture that can grow from desktop use to daemon and remote UI operation
+
+- registro rapido de QSOs para uso real em estacao
+- controle local dos dados com arquivos simples e SQLite
+- uma arquitetura que pode crescer do desktop para daemon e interface remota
+
+## Why It Is Easy To Use | Facilidade de Uso
+
+`PyCQLog` is designed so the operator can start quickly and keep the workflow clear:
+
+O `PyCQLog` foi desenhado para que o operador comece rapido e mantenha um fluxo claro:
+
+- clean manual QSO entry
+- recent QSOs and callsign history on the same screen
+- quick ADIF import and export
+- built-in dashboard for operating visibility
+- PT-BR and English interface
+- local mode or daemon plus remote UI mode, depending on the station setup
+
+- captura manual de QSO sem excesso de passos
+- QSOs recentes e historico do callsign na mesma tela
+- importacao e exportacao ADIF de forma direta
+- dashboard integrado para acompanhar a operacao
+- interface em PT-BR e English
+- uso local ou modo daemon com UI remota, conforme a estacao
 
 ## Highlights
 
@@ -18,43 +52,34 @@ The project aims to combine practical daily operation with a codebase that is ea
 - local SQLite persistence
 - multiple logbooks with active log selection
 - reusable operator and station profiles
-- ADIF import/export
+- ADIF import and export
 - dashboard with operating statistics
 - PT-BR and English interface
-- light, dark, and system theme
-- initial WSJT-X / JTDX UDP integration
-- configurable realtime Club Log and QRZ.com queues
-- LoTW (TQSL) automated ADIF export and signing
-- QRZ.com Callbook automatic lookup
+- light, dark, and system themes
+- WSJT-X and JTDX UDP capture
+- realtime Club Log and QRZ.com queue support
+- QRZ.com Callbook lookup
+- LoTW ADIF export and TQSL signing
+- daemon mode with HTTP API
+- remote UI support with host, port, and auth code
 
-## Status
+## Operating Modes | Modos de Operacao
 
-The project is under active development and already usable for early operation and validation.
+`PyCQLog` can be used in three main ways:
 
-## Current Scope
+O `PyCQLog` pode ser usado de tres formas principais:
 
-The current public version already includes:
+1. Local desktop: the UI uses the local database and integrations on the same machine.
+2. Daemon only: a small Linux host or Raspberry Pi keeps UDP capture and online queues running.
+3. Remote UI: the desktop UI connects to a daemon running on another host in the local network.
 
-- layered architecture
-- local SQLite persistence
-- PyQt6 desktop UI for QSO CRUD
-- callsign history
-- PT-BR and English support
-- persistent settings
-- operational dashboard
-- multiple logbooks with active log selection
-- reusable operator and station profiles
-- improved local prefix resolution for DXCC, WAZ, and WPX
-- `system`, `light`, and `dark` theme support
-- ADIF import and export
-- initial WSJT-X / JTDX UDP integration
-- configurable realtime Club Log and QRZ.com queues for UDP and manual QSOs
-- LoTW (TQSL) automated ADIF export and signing
-- QRZ.com Callbook automatic lookup
+1. Desktop local: a interface usa o banco e as integracoes na mesma maquina.
+2. Somente daemon: um host Linux pequeno ou Raspberry Pi mantem a captura UDP e as filas online em execucao.
+3. UI remota: a interface desktop se conecta a um daemon executando em outro host da rede local.
 
-## Documentacao
+## Documentation | Documentacao
 
-- Current project documentation: [docs/README.md](docs/README.md)
+- Project docs index: [docs/README.md](docs/README.md)
 - Quick start in Portuguese: [docs/inicio_rapido_pt-BR.md](docs/inicio_rapido_pt-BR.md)
 - Quick start in English: [docs/quick_start_en.md](docs/quick_start_en.md)
 - User guide in Portuguese: [docs/guia_do_usuario_pt-BR.md](docs/guia_do_usuario_pt-BR.md)
@@ -62,7 +87,7 @@ The current public version already includes:
 - FAQ in Portuguese: [docs/faq_pt-BR.md](docs/faq_pt-BR.md)
 - FAQ in English: [docs/faq_en.md](docs/faq_en.md)
 
-## Instalacao para desenvolvimento
+## Installation For Development | Instalacao para Desenvolvimento
 
 ```bash
 python3 -m venv .venv
@@ -70,21 +95,60 @@ source .venv/bin/activate
 pip install -e .[dev]
 ```
 
-## Run
+## Running The Application | Como Iniciar
+
+Full local desktop mode:
+
+Modo desktop local completo:
 
 ```bash
-./pycqlog
+pycqlog
 ```
 
-Or via module:
+Desktop UI only:
+
+Somente a interface:
+
+```bash
+pycqlog --ui
+```
+
+Daemon only:
+
+Somente o daemon:
+
+```bash
+pycqlog --service
+```
+
+Alternative module form:
+
+Forma alternativa via modulo:
 
 ```bash
 PYTHONPATH=src python3 -m pycqlog.main
 ```
 
+## Configuration Files | Arquivos de Configuracao
+
+The project now uses separate configuration files:
+
+O projeto agora usa arquivos separados de configuracao:
+
+- UI: `~/.config/pycqlog/pycqlog_ui.conf`
+- daemon: `~/.config/pycqlog/pycqlog_daemon.conf`
+
+The desktop UI can edit remote connection settings directly from:
+
+A interface pode editar as configuracoes de conexao remota diretamente em:
+
+`Integracoes > Remotos`
+
 ## Debian Package
 
 To build a `.deb` package locally:
+
+Para gerar um pacote `.deb` localmente:
 
 ```bash
 bash packaging/build_deb.sh
@@ -92,17 +156,21 @@ bash packaging/build_deb.sh
 
 The package will be generated under `dist/deb/`.
 
-To install it on another Linux computer:
+O pacote sera gerado em `dist/deb/`.
+
+To install it:
+
+Para instalar:
 
 ```bash
 sudo apt install ./dist/deb/pycqlog_<version>_all.deb
 ```
 
-Using `apt` is recommended so the system can also install package dependencies such as `python3-pyqt6`.
-
 ## Linux Notes
 
 If Qt fails with the `xcb` plugin, install:
+
+Se o Qt falhar com o plugin `xcb`, instale:
 
 ```bash
 sudo apt-get install -y \
@@ -113,15 +181,13 @@ sudo apt-get install -y \
   libxcb-render-util0
 ```
 
-If your session uses Wayland, the `pycqlog` launcher already tries Wayland automatically.
-
 ## Testing
 
 ```bash
 pytest
 ```
 
-## Publicacao e colaboracao
+## License And Contribution | Licenca e Colaboracao
 
 - License: [MIT](LICENSE)
 - Contribution guide: [CONTRIBUTING.md](CONTRIBUTING.md)

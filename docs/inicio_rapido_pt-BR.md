@@ -2,9 +2,24 @@
 
 ## Objetivo
 
-Este guia foi feito para colocar o `PyCQLog` em operacao em poucos minutos.
+Este guia coloca o `PyCQLog` em operacao rapidamente, com foco em simplicidade.
 
-## Em 5 minutos
+O projeto foi pensado para que voce consiga:
+
+- abrir a interface e registrar um QSO em poucos minutos
+- importar ou exportar ADIF sem passos excessivos
+- integrar com JTDX ou WSJT-X
+- evoluir depois para um daemon remoto, se a estacao exigir
+
+## Formas de uso
+
+O `PyCQLog` pode ser usado de tres formas:
+
+1. Desktop local, quando tudo roda na mesma maquina.
+2. Somente daemon, para servidor pequeno ou Raspberry Pi.
+3. UI remota, quando a interface acessa um daemon em outro host.
+
+## Em poucos minutos
 
 1. Crie e ative um ambiente virtual:
 
@@ -19,10 +34,24 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-3. Abra o sistema:
+3. Inicie no modo desejado:
+
+Desktop local:
 
 ```bash
-./pycqlog
+pycqlog
+```
+
+Somente daemon:
+
+```bash
+pycqlog --service
+```
+
+Somente interface:
+
+```bash
+pycqlog --ui
 ```
 
 Se voce tiver um pacote `.deb`, tambem pode instalar assim:
@@ -31,16 +60,21 @@ Se voce tiver um pacote `.deb`, tambem pode instalar assim:
 sudo apt install ./pycqlog_<versao>_all.deb
 ```
 
-4. Revise estas configuracoes:
+## Primeira configuracao
+
+Revise estes pontos:
 
 - `Configuracoes > Idioma`
 - `Configuracoes > Tema`
 - `Configuracoes > Diretorios`
 - `Configuracoes > ADIF`
+- `Integracoes > Remotos`
 
-5. Crie ou selecione um `Logbook`.
+Se voce estiver usando a interface contra um daemon remoto, ajuste em `Integracoes > Remotos`:
 
-6. Registre um QSO manual ou importe um arquivo `ADIF`.
+- IP ou host do daemon
+- porta
+- codigo de autenticacao
 
 ## Primeiro QSO manual
 
@@ -90,36 +124,33 @@ Voce pode exportar:
 - por banda
 - por modo
 
-## Dashboard
-
-Menu:
-
-```text
-Dashboard > Abrir Dashboard
-```
-
-Use o dashboard para acompanhar:
-
-- volume de QSOs
-- bandas e modos ativos
-- horarios de operacao
-- top callsigns
-- indicadores estimados de DXCC, CQ e WPX
-
 ## Integracao com JTDX ou WSJT-X
 
 Menu:
 
 ```text
-Configuracoes > Integracoes > JTDX / Club Log
+Integracoes > Remotos
 ```
 
-Para iniciar:
+Para captura local:
 
 1. habilite o listener `UDP`
 2. defina `host` e `porta`
 3. configure o `JTDX` ou `WSJT-X` para enviar `Logged ADIF`
-4. acompanhe o resultado em `Configuracoes > Integracoes > Monitor`
+4. acompanhe em `Integracoes > Monitor da Integracao`
+
+## Modo remoto
+
+Arquivos usados:
+
+- UI: `~/.config/pycqlog/pycqlog_ui.conf`
+- daemon: `~/.config/pycqlog/pycqlog_daemon.conf`
+
+Exemplo:
+
+- no servidor, rode `pycqlog --service`
+- no cliente, configure `service_remote_enabled = true`
+- abra a UI com `pycqlog --ui`
 
 ## Onde procurar ajuda
 

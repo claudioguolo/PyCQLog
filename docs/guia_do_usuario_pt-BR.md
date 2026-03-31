@@ -2,11 +2,17 @@
 
 ## Objetivo
 
-Este guia foi escrito para quem vai usar o `PyCQLog` no dia a dia. Ele cobre instalacao, configuracao inicial, operacao basica, importacao e exportacao de logs, dashboard e integracoes.
+Este guia foi escrito para quem vai usar o `PyCQLog` no dia a dia. Ele cobre instalacao, configuracao inicial, operacao basica, importacao e exportacao de logs, dashboard, integracoes e o uso em modo local ou remoto.
 
 ## O que o PyCQLog faz hoje
 
-O `PyCQLog` e uma aplicacao desktop para radioamadorismo com foco em operacao local e controle dos dados pelo proprio operador.
+O `PyCQLog` e um logger para radioamadorismo com foco em simplicidade operacional, controle local dos dados e evolucao gradual da estacao.
+
+Na pratica, ele tenta resolver tres necessidades comuns:
+
+- registrar QSOs rapidamente sem uma interface pesada
+- manter os dados sob controle do proprio operador
+- permitir crescimento futuro, de uma estacao simples ate um host remoto dedicado
 
 Recursos principais:
 
@@ -22,6 +28,14 @@ Recursos principais:
 - integracao inicial com `WSJT-X / JTDX`
 - fila configuravel para `Club Log`
 - interface em `pt-BR` e `en`
+
+## Modelos de uso
+
+Hoje o `PyCQLog` pode ser usado assim:
+
+- desktop local, com interface e banco na mesma maquina
+- daemon em um host Linux ou Raspberry Pi
+- interface grafica em outro computador da rede, conectada ao daemon
 
 ## Requisitos
 
@@ -64,6 +78,18 @@ Alternativa:
 PYTHONPATH=src python3 -m pycqlog.main
 ```
 
+Somente daemon:
+
+```bash
+pycqlog --service
+```
+
+Somente interface:
+
+```bash
+pycqlog --ui
+```
+
 ## Primeira abertura
 
 Ao abrir a aplicacao pela primeira vez, revise estes pontos:
@@ -73,6 +99,7 @@ Ao abrir a aplicacao pela primeira vez, revise estes pontos:
 3. diretorio de dados
 4. diretorio padrao dos logs
 5. logbook ativo
+6. conexao remota, se voce estiver usando daemon em outro host
 
 ## Estrutura principal da janela
 
@@ -84,6 +111,8 @@ A janela principal e composta por:
 - filtros rapidos por banda e modo
 - painel de historico por callsign
 - barra de menus para configuracoes, dashboard e ajuda
+
+O objetivo da tela principal e concentrar o essencial de operacao sem forcar troca constante de janelas.
 
 ## Logbooks
 
@@ -257,6 +286,26 @@ Voce pode alternar entre:
 - ultimos 7 dias
 - ultimos 30 dias
 - ultimos 12 meses
+
+## Operacao remota
+
+Quando voce quiser separar o servico da interface:
+
+- o daemon usa `~/.config/pycqlog/pycqlog_daemon.conf`
+- a interface usa `~/.config/pycqlog/pycqlog_ui.conf`
+
+Na interface, os ajustes de conexao ficam em:
+
+```text
+Integracoes > Remotos
+```
+
+Ali voce pode definir:
+
+- uso de daemon remoto
+- IP ou host
+- porta
+- codigo de autenticacao
 
 ## Idioma e tema
 

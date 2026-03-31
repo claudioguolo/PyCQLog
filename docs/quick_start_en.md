@@ -2,9 +2,24 @@
 
 ## Purpose
 
-This guide helps you get `PyCQLog` running in a few minutes.
+This guide gets `PyCQLog` running quickly, with a focus on ease of use.
 
-## In 5 minutes
+The project is designed so you can:
+
+- open the UI and log a QSO in a few minutes
+- import or export ADIF without too many steps
+- integrate with JTDX or WSJT-X
+- later grow into a remote daemon setup if your station needs it
+
+## Operating styles
+
+`PyCQLog` can be used in three ways:
+
+1. Local desktop, when everything runs on the same machine.
+2. Daemon only, for a small server or Raspberry Pi.
+3. Remote UI, when the desktop connects to a daemon on another host.
+
+## In a few minutes
 
 1. Create and activate a virtual environment:
 
@@ -19,10 +34,24 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-3. Start the app:
+3. Start the mode you need:
+
+Full local desktop:
 
 ```bash
-./pycqlog
+pycqlog
+```
+
+Daemon only:
+
+```bash
+pycqlog --service
+```
+
+UI only:
+
+```bash
+pycqlog --ui
 ```
 
 If you already have a `.deb` package, you can also install it with:
@@ -31,16 +60,21 @@ If you already have a `.deb` package, you can also install it with:
 sudo apt install ./pycqlog_<version>_all.deb
 ```
 
-4. Review these settings:
+## First configuration
+
+Review these items:
 
 - `Settings > Language`
 - `Settings > Theme`
 - `Settings > Directories`
 - `Settings > ADIF`
+- `Integrations > Remotes`
 
-5. Create or select a `Logbook`.
+If the UI will connect to a remote daemon, configure in `Integrations > Remotes`:
 
-6. Save a manual QSO or import an `ADIF` file.
+- daemon IP or host
+- port
+- authentication code
 
 ## First manual QSO
 
@@ -90,36 +124,33 @@ You can export:
 - by band
 - by mode
 
-## Dashboard
-
-Menu:
-
-```text
-Dashboard > Open Dashboard
-```
-
-Use it to follow:
-
-- QSO volume
-- active bands and modes
-- operating hours
-- top callsigns
-- estimated DXCC, CQ, and WPX indicators
-
 ## JTDX or WSJT-X integration
 
 Menu:
 
 ```text
-Settings > Integrations > JTDX / Club Log
+Integrations > Remotes
 ```
 
-To begin:
+For local capture:
 
 1. enable the `UDP` listener
 2. set `host` and `port`
 3. configure `JTDX` or `WSJT-X` to send `Logged ADIF`
-4. monitor results in `Settings > Integrations > Monitor`
+4. monitor results in `Integrations > Integration Monitor`
+
+## Remote mode
+
+Files used:
+
+- UI: `~/.config/pycqlog/pycqlog_ui.conf`
+- daemon: `~/.config/pycqlog/pycqlog_daemon.conf`
+
+Example:
+
+- on the server, run `pycqlog --service`
+- on the client, set `service_remote_enabled = true`
+- open the UI with `pycqlog --ui`
 
 ## Where to go next
 

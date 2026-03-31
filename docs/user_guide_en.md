@@ -2,11 +2,17 @@
 
 ## Purpose
 
-This guide is for people who want to use `PyCQLog` in practice. It covers installation, first-time setup, daily operation, ADIF workflows, dashboard usage, and integrations.
+This guide is for people who want to use `PyCQLog` in practice. It covers installation, first-time setup, daily operation, ADIF workflows, dashboard usage, integrations, and local or remote operation.
 
 ## What PyCQLog does today
 
-`PyCQLog` is a desktop application for amateur radio focused on local-first operation and operator-controlled data.
+`PyCQLog` is an amateur radio logger focused on operational simplicity, local data ownership, and gradual station growth.
+
+In practice, it tries to solve three common needs:
+
+- log QSOs quickly without a heavy workflow
+- keep data under the operator's control
+- allow growth from a single desktop to a dedicated remote host
 
 Current highlights:
 
@@ -22,6 +28,14 @@ Current highlights:
 - initial `WSJT-X / JTDX` integration
 - configurable `Club Log` queue
 - `pt-BR` and `en` interface
+
+## Usage models
+
+Today `PyCQLog` can be used as:
+
+- a local desktop application, with UI and database on the same machine
+- a daemon on a Linux host or Raspberry Pi
+- a desktop UI on another computer connected to that daemon
 
 ## Requirements
 
@@ -64,6 +78,18 @@ Alternative:
 PYTHONPATH=src python3 -m pycqlog.main
 ```
 
+Daemon only:
+
+```bash
+pycqlog --service
+```
+
+UI only:
+
+```bash
+pycqlog --ui
+```
+
 ## First run checklist
 
 Review these items on first launch:
@@ -73,6 +99,7 @@ Review these items on first launch:
 3. data directory
 4. default logs directory
 5. active logbook
+6. remote connection, if your UI will use a daemon on another host
 
 ## Main window layout
 
@@ -84,6 +111,8 @@ The main window includes:
 - quick band and mode filters
 - callsign history panel
 - menu bar for settings, dashboard, and help
+
+The main screen is intentionally compact so the most useful operating context stays visible without jumping across multiple windows.
 
 ## Logbooks
 
@@ -257,6 +286,26 @@ You can switch between:
 - last 7 days
 - last 30 days
 - last 12 months
+
+## Remote operation
+
+When you want to separate service and UI:
+
+- the daemon uses `~/.config/pycqlog/pycqlog_daemon.conf`
+- the desktop UI uses `~/.config/pycqlog/pycqlog_ui.conf`
+
+In the desktop UI, remote connection settings are available under:
+
+```text
+Integrations > Remotes
+```
+
+There you can configure:
+
+- use of a remote daemon
+- IP or host
+- port
+- authentication code
 
 ## Language and theme
 

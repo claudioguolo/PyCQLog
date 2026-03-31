@@ -630,7 +630,7 @@ class MainWindow(QMainWindow):
         return wrapper
 
     def _apply_translations(self) -> None:
-        self.setWindowTitle(self._t("app.title"))
+        self.setWindowTitle(self._app_window_title())
         self.operation_badge_label.setText(self._t("section.operation_console"))
         self.header_label.setText(self._t("section.manual_entry"))
         self.console_hint_label.setText(self._t("section.operation_console_hint"))
@@ -741,6 +741,15 @@ class MainWindow(QMainWindow):
             self._refresh_history(self._last_history_callsign)
         else:
             self._clear_history()
+
+    def _app_window_title(self) -> str:
+        try:
+            from pycqlog import __version__
+
+            version_text = __version__
+        except ImportError:
+            version_text = "0.1.0"
+        return f"{self._t('app.title')} by PY9MT v{version_text}"
 
     def _t(self, key: str, **kwargs: object) -> str:
         return self._localization.t(key, **kwargs)
